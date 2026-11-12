@@ -167,19 +167,16 @@ fn metric_card(icon_name: &str, title: &str) -> (gtk::Box, gtk::Label) {
 
 async fn fetch_metrics() -> HomeCommandOutput {
     let battery = {
-        let b0 = tokio::fs::read_to_string(SYS_BATTERY0_CAPACITY)
-            .await
-            .ok()
-            .and_then(|s| s.trim().parse::<u8>().ok());
-        let b1 = tokio::fs::read_to_string(SYS_BATTERY1_CAPACITY)
-            .await
-            .ok()
-            .and_then(|s| s.trim().parse::<u8>().ok());
-        match (b0, b1) {
-            (Some(a), Some(b)) => format!("{}%", (a as u16 + b as u16) / 2),
-            (Some(a), None) | (None, Some(a)) => format!("{}%", a),
-            (None, None) => "N/A".to_string(),
+        let paths = find_battery_capacity_paths();
+        let mut capacities = Vec::new();
+        for path in paths {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if let Ok(val) = content.trim().parse::<u32>() {
+                    capacities.push(val);
+                }
+            }
         }
+        aggregate_battery_percentage(&capacities)
     };
 
     let cpu = {
@@ -188,12 +185,10 @@ async fn fetch_metrics() -> HomeCommandOutput {
             .map(|s| s.split_whitespace().next().unwrap_or("?").to_string())
             .unwrap_or_else(|_| "?".to_string());
 
-        let temp = tokio::fs::read_to_string(SYS_THERMAL_ZONE0_TEMP)
+        let temp_path = find_cpu_temp_path();
+        let temp = tokio::fs::read_to_string(&temp_path)
             .await
-            .map(|s| {
-                let millideg: i32 = s.trim().parse().unwrap_or(0);
-                format!("{}°C", millideg / 1000)
-            })
+            .map(|s| format_cpu_temp(&s))
             .unwrap_or_else(|_| "?°C".to_string());
 
         format!("{}% | {}", load, temp)

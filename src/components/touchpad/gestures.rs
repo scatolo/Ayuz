@@ -135,7 +135,9 @@ impl Component for GesturesModel {
         sender.command(|out, shutdown| {
             shutdown
                 .register(async move {
-                    let ok = crate::services::commands::which_exists("brightnessctl").await;
+                    let ok = crate::services::commands::is_gnome_desktop()
+                        || crate::services::commands::is_kde_desktop()
+                        || crate::services::commands::which_exists("brightnessctl").await;
                     out.send(GesturesCommandOutput::BrightnessctlChecked(ok)).ok();
                 })
                 .drop_on_shutdown()

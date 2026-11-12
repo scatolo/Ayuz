@@ -16,10 +16,12 @@
 
 use evdev::{AbsoluteAxisCode, EventSummary, KeyCode};
 use rust_i18n::t;
+use std::sync::OnceLock;
 use tokio::sync::watch;
 
-use crate::services::commands::is_kde_desktop;
+use crate::services::commands::{is_gnome_desktop, is_kde_desktop};
 use crate::services::evdev_runner::{find_touchpad, open_event_stream, touchpad_abs_bounds};
+use crate::services::gnome_brightness;
 use crate::services::kde_brightness;
 
 /// Fraction of touchpad width/height that counts as an edge zone (4%)
@@ -83,6 +85,44 @@ async fn run_action(program: &str, args: &[&str]) {
                 error = e.to_string()
             )
         );
+    }
+}
+
+/// Returns true if `wpctl` is available on the system, caching the result.
+fn has_wpctl() -> bool {
+    static HAS_WPCTL: OnceLock<bool> = OnceLock::new();
+    *HAS_WPCTL.get_or_init(|| {
+        if std::path::Path::new("/usr/bin/wpctl").is_file() {
+            return true;
+        }
+        std::process::Command::new("which")
+            .arg("wpctl")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Returns the program and argument lists needed to adjust volume.
+pub(crate) fn volume_commands(has_wpctl: bool, increase: bool) -> [(&'static str, &'static [&'static str]); 2] {
+    if has_wpctl {
+        let vol_arg = if increase { "5%+" } else { "5%-" };
+        [
+            ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]),
+            ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", vol_arg]),
+        ]
+    } else {
+        let vol_arg = if increase { "+5%" } else { "-5%" };
+        [
+            ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"]),
+            ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", vol_arg]),
+        ]
+    }
+}
+
+async fn adjust_volume(increase: bool) {
+    for (prog, args) in volume_commands(has_wpctl(), increase) {
+        run_action(prog, args).await;
     }
 }
 
@@ -182,24 +222,7 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
                             let dy = value - *last_y;
                             if dy.abs() >= STEP_THRESHOLD {
                                 *last_y = value;
-                                run_action(
-                                    "pactl",
-                                    &["set-sink-mute", "@DEFAULT_SINK@", "0"],
-                                )
-                                .await;
-                                if dy < 0 {
-                                    run_action(
-                                        "pactl",
-                                        &["set-sink-volume", "@DEFAULT_SINK@", "+5%"],
-                                    )
-                                    .await;
-                                } else {
-                                    run_action(
-                                        "pactl",
-                                        &["set-sink-volume", "@DEFAULT_SINK@", "-5%"],
-                                    )
-                                    .await;
-                                }
+                                adjust_volume(dy < 0).await;
                             }
                         }
                         GestureState::RightEdge { last_y } => {
@@ -214,6 +237,15 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
                                     {
                                         tracing::warn!(
                                             "PowerDevil setBrightness failed, falling back to brightnessctl: {e}"
+                                        );
+                                        run_action("brightnessctl", &["set", arg]).await;
+                                    }
+                                } else if is_gnome_desktop() {
+                                    if let Err(e) =
+                                        gnome_brightness::adjust_brightness_relative(delta).await
+                                    {
+                                        tracing::warn!(
+                                            "GNOME brightness adjustment failed, falling back to brightnessctl: {e}"
                                         );
                                         run_action("brightnessctl", &["set", arg]).await;
                                     }
@@ -237,6 +269,67 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
                 state = GestureState::Other;
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_volume_commands_wpctl() {
+        let up = volume_commands(true, true);
+        assert_eq!(up[0], ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"][..]));
+        assert_eq!(up[1], ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+" ][..]));
+
+        let down = volume_commands(true, false);
+        assert_eq!(down[0], ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"][..]));
+        assert_eq!(down[1], ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-" ][..]));
+    }
+
+    #[test]
+    fn test_volume_commands_pactl() {
+        let up = volume_commands(false, true);
+        assert_eq!(up[0], ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"][..]));
+        assert_eq!(up[1], ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", "+5%"][..]));
+
+        let down = volume_commands(false, false);
+        assert_eq!(down[0], ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"][..]));
+        assert_eq!(down[1], ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", "-5%"][..]));
+    }
+
+    #[test]
+    fn test_try_classify() {
+        let mut state = GestureState::Classifying { x: Some(30), y: Some(500) };
+        try_classify(&mut state, 100, 900, 100);
+        match state {
+            GestureState::LeftEdge { last_y } => assert_eq!(last_y, 500),
+            _ => panic!("Expected LeftEdge"),
+        }
+
+        let mut state = GestureState::Classifying { x: Some(950), y: Some(500) };
+        try_classify(&mut state, 100, 900, 100);
+        match state {
+            GestureState::RightEdge { last_y } => assert_eq!(last_y, 500),
+            _ => panic!("Expected RightEdge"),
+        }
+
+        let mut state = GestureState::Classifying { x: Some(500), y: Some(50) };
+        try_classify(&mut state, 100, 900, 100);
+        match state {
+            GestureState::TopEdge { start_x, done } => {
+                assert_eq!(start_x, 500);
+                assert!(!done);
+            }
+            _ => panic!("Expected TopEdge"),
+        }
+
+        let mut state = GestureState::Classifying { x: Some(500), y: Some(500) };
+        try_classify(&mut state, 100, 900, 100);
+        match state {
+            GestureState::Other => {}
+            _ => panic!("Expected Other"),
         }
     }
 }
