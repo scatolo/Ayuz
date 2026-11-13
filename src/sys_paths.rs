@@ -22,7 +22,9 @@ pub const SYS_BIOS_VERSION: &str = "/sys/class/dmi/id/bios_version";
 pub const SYS_BIOS_DATE: &str = "/sys/class/dmi/id/bios_date";
 pub const SYS_PRODUCT_SERIAL: &str = "/sys/class/dmi/id/product_serial";
 pub const SYS_POWER_SUPPLY_DIR: &str = "/sys/class/power_supply";
+#[allow(dead_code)]
 pub const SYS_BATTERY0_CAPACITY: &str = "/sys/class/power_supply/BAT0/capacity";
+#[allow(dead_code)]
 pub const SYS_BATTERY1_CAPACITY: &str = "/sys/class/power_supply/BAT1/capacity";
 pub const SYS_LOAD_AVG: &str = "/proc/loadavg";
 pub const SYS_MEM_INFO: &str = "/proc/meminfo";

@@ -122,93 +122,90 @@ mod tests {
         // Verbatim DMI product_name on ASUS Zenbook 14 UX3405CA
         let verbatim_dmi = "ASUS Zenbook 14 UX3405CA_UX3405CA";
         let layout = for_product(verbatim_dmi);
-        assert!(std::ptr::eq(layout, &UX3405MA_5X4));
         assert_eq!(layout, &UX3405MA_5X4);
         assert_eq!(layout.rows, 4);
         assert_eq!(layout.cols, 5);
         assert_eq!(layout.cells.len(), 20);
 
         // Substrings / variations
-        assert!(std::ptr::eq(for_product("UX3405CA"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("Zenbook 14 OLED UX3405CA"), &UX3405MA_5X4));
+        assert_eq!(for_product("UX3405CA"), &UX3405MA_5X4);
+        assert_eq!(for_product("Zenbook 14 OLED UX3405CA"), &UX3405MA_5X4);
     }
 
     #[test]
     fn test_ux3405ma_backward_compatibility() {
         let verbatim_dmi = "ASUS Zenbook 14 UX3405MA_UX3405MA";
         let layout = for_product(verbatim_dmi);
-        assert!(std::ptr::eq(layout, &UX3405MA_5X4));
         assert_eq!(layout, &UX3405MA_5X4);
-        assert!(std::ptr::eq(for_product("UX3405MA"), &UX3405MA_5X4));
+        assert_eq!(for_product("UX3405MA"), &UX3405MA_5X4);
     }
 
     #[test]
     fn test_ux3405_family_variants() {
         // Bare prefix and future variants
-        assert!(std::ptr::eq(for_product("UX3405"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("UX3405V"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("UX3405EA"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("ASUS Zenbook UX3405-OLED"), &UX3405MA_5X4));
+        assert_eq!(for_product("UX3405"), &UX3405MA_5X4);
+        assert_eq!(for_product("UX3405V"), &UX3405MA_5X4);
+        assert_eq!(for_product("UX3405EA"), &UX3405MA_5X4);
+        assert_eq!(for_product("ASUS Zenbook UX3405-OLED"), &UX3405MA_5X4);
     }
 
     #[test]
     fn test_other_overrides_retention() {
         // UM3402 models
-        assert!(std::ptr::eq(for_product("UM3402"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("Zenbook UM3402YA_UM3402YA"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("ASUS Zenbook 14 UM3402"), &UX3405MA_5X4));
+        assert_eq!(for_product("UM3402"), &UX3405MA_5X4);
+        assert_eq!(for_product("Zenbook UM3402YA_UM3402YA"), &UX3405MA_5X4);
+        assert_eq!(for_product("ASUS Zenbook 14 UM3402"), &UX3405MA_5X4);
 
         // B3302 models
-        assert!(std::ptr::eq(for_product("B3302"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("ASUS ExpertBook B3302FEA"), &UX3405MA_5X4));
-        assert!(std::ptr::eq(for_product("B3302F"), &UX3405MA_5X4));
+        assert_eq!(for_product("B3302"), &UX3405MA_5X4);
+        assert_eq!(for_product("ASUS ExpertBook B3302FEA"), &UX3405MA_5X4);
+        assert_eq!(for_product("B3302F"), &UX3405MA_5X4);
     }
 
     #[test]
     fn test_universal_4x4_fallback() {
         // Other ASUS laptops
         let fallback_zenbook = for_product("Zenbook UX430UA");
-        assert!(std::ptr::eq(fallback_zenbook, &UNIVERSAL_4X4));
         assert_eq!(fallback_zenbook, &UNIVERSAL_4X4);
         assert_eq!(fallback_zenbook.rows, 4);
         assert_eq!(fallback_zenbook.cols, 4);
         assert_eq!(fallback_zenbook.cells.len(), 16);
 
-        assert!(std::ptr::eq(for_product("ROG Zephyrus G14"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("TUF Gaming A15"), &UNIVERSAL_4X4));
+        assert_eq!(for_product("ROG Zephyrus G14"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("TUF Gaming A15"), &UNIVERSAL_4X4);
 
         // Non-ASUS laptops
-        assert!(std::ptr::eq(for_product("ThinkPad X1 Carbon Gen 10"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("Dell XPS 13 9310"), &UNIVERSAL_4X4));
+        assert_eq!(for_product("ThinkPad X1 Carbon Gen 10"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("Dell XPS 13 9310"), &UNIVERSAL_4X4);
     }
 
     #[test]
     fn test_near_misses_do_not_match_ux3405() {
-        assert!(std::ptr::eq(for_product("UX340"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("UX3404"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("UX3406"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("UX3450"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("UX5405"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("3405"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("UM340"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("B330"), &UNIVERSAL_4X4));
+        assert_eq!(for_product("UX340"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("UX3404"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("UX3406"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("UX3450"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("UX5405"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("3405"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("UM340"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("B330"), &UNIVERSAL_4X4);
     }
 
     #[test]
     fn test_edge_cases_and_empty_inputs() {
         // Empty string
-        assert!(std::ptr::eq(for_product(""), &UNIVERSAL_4X4));
+        assert_eq!(for_product(""), &UNIVERSAL_4X4);
         // Whitespace only
-        assert!(std::ptr::eq(for_product("   "), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("\t\n"), &UNIVERSAL_4X4));
+        assert_eq!(for_product("   "), &UNIVERSAL_4X4);
+        assert_eq!(for_product("\t\n"), &UNIVERSAL_4X4);
         // Case sensitivity (DMI is uppercase; lowercase should not match)
-        assert!(std::ptr::eq(for_product("ux3405"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("ux3405ca"), &UNIVERSAL_4X4));
-        assert!(std::ptr::eq(for_product("um3402"), &UNIVERSAL_4X4));
+        assert_eq!(for_product("ux3405"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("ux3405ca"), &UNIVERSAL_4X4);
+        assert_eq!(for_product("um3402"), &UNIVERSAL_4X4);
         // Punctuation and symbols
-        assert!(std::ptr::eq(for_product("!@#$%^&*()"), &UNIVERSAL_4X4));
+        assert_eq!(for_product("!@#$%^&*()"), &UNIVERSAL_4X4);
         // Embedded substring matches
-        assert!(std::ptr::eq(for_product("MODEL_UX3405_EXTRA"), &UX3405MA_5X4));
+        assert_eq!(for_product("MODEL_UX3405_EXTRA"), &UX3405MA_5X4);
     }
 
     #[test]
@@ -266,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_distinct_layouts() {
-        assert!(!std::ptr::eq(&UNIVERSAL_4X4, &UX3405MA_5X4));
+        assert_ne!(&UNIVERSAL_4X4, &UX3405MA_5X4);
         assert_ne!(UNIVERSAL_4X4.cols, UX3405MA_5X4.cols);
     }
 }
