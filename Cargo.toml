@@ -1,6 +1,6 @@
 [package]
 name = "ayuz"
-version = "1.1.10"
+version = "1.1.10-ux3405.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Traciges/Ayuz"
@@ -44,6 +44,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
+version = "1.1.10+ux3405.1"
 assets = [
     { source = "target/release/ayuz", dest = "/usr/bin/ayuz", mode = "755" },
     { source = "packaging/de.guido.ayuz.desktop", dest = "/usr/share/applications/de.guido.ayuz.desktop", mode = "644" },
@@ -64,4 +65,4 @@ auto_link_exclude_list = [
 ]
 icon = "assets/trayicon.png"
 desktop_entry = "packaging/ayuz-appimage.desktop"
-assets = ["packaging/appimage/usr", "assets/anime"]
+assets = ["assets/anime"]

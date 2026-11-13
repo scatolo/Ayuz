@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>Tested on:</strong> ASUS Zenbook S16 · Fedora 43 · KDE Plasma
+  <strong>Tested on:</strong> ASUS Zenbook S16 · Fedora 43 · KDE Plasma &nbsp;|&nbsp; ASUS Zenbook 14 OLED (UX3405CA) · Fedora 44 · GNOME (Wayland)
 </p>
 
 ---
@@ -79,6 +79,8 @@ The application is smart about availability: if a required tool or desktop envir
 > **Bundled color gamut presets:** Native, sRGB, DCI-P3 and Display P3 <br>
 > These presets are the original ASUS color gamut profiles.
 
+> **GNOME vs KDE Display support:** On GNOME, display brightness and color management are handled natively by GNOME Settings / Mutter. The OLED-specific Display controls above (Flicker-Free Dimming, Color Gamut switching, Target Mode, Pixel Refresh, Panel settings) require KDE Plasma (or COSMIC where supported) and are automatically disabled on GNOME.
+
 ### Keyboard
 
 | Feature             | Description                                                                    | Requires           |
@@ -117,14 +119,20 @@ Controls for the AniMatrix LED matrix display found on select ROG laptops (e.g. 
 
 | Feature         | Description                                                               | Requires                     |
 | --------------- | ------------------------------------------------------------------------- | ---------------------------- |
-| Smart Gestures  | Control volume, brightness, and media playback via touchpad edge swipes   | `brightnessctl`, `playerctl` |
+| Smart Gestures  | Control volume, brightness, and media playback via touchpad edge swipes   | user in `input` group; `wpctl` (or `pactl`), GNOME/KDE D-Bus (or `brightnessctl`), `playerctl` |
 | Touchpad Toggle | Enable or disable the touchpad, with a 10-second auto-revert safety timer | KDE or GNOME                 |
 | While Typing    | Palm rejection: suppress Smart Gestures and/or disable the touchpad entirely while typing, with a configurable reactivation delay (0.1-5 s) after the last keystroke | user in `input` group; KDE or GNOME for the touchpad option |
-| ASUS NumberPad  | Toggle the LED numeric keypad embedded in the touchpad. Emits standard Linux Numpad keycodes (`KEY_KP0`..`KEY_KPENTER`) through a virtual uinput device, so international keyboard layouts (e.g. German, Lithuanian) work natively. | `i2c-dev` + `uinput` kernel modules; user in `i2c` and `input` groups (see below) |
+| ASUS NumberPad  | Toggle the LED numeric keypad embedded in the touchpad. Emits standard Linux Numpad keycodes (`KEY_KP0`..`KEY_KPENTER`) through a virtual uinput device, so international keyboard layouts (e.g. German, Lithuanian) work natively. Includes a proportional 5×4 layout (`UX3405`, `UM3402`, `B3302`) alongside the universal 4×4 grid. | Physical NumberPad LED hardware + `i2c-dev` & `uinput` kernel modules; user in `i2c` and `input` groups (see below) |
+
+> **GNOME Wayland Smart Gestures:** On GNOME Wayland (e.g. Fedora 44), Smart Gestures work natively without `pactl` or root permissions on `brightnessctl`: volume uses **PipeWire (`wpctl`)** (falling back to `pactl`), and brightness uses **Mutter / GNOME Settings Daemon D-Bus** (`org.gnome.Mutter.DisplayConfig` on GNOME 47+ Wayland, with `org.gnome.SettingsDaemon.Power.Screen` and `brightnessctl` as fallbacks).
+
+> **ASUS Zenbook 14 OLED (UX3405CA) & Touchpad-only SKUs:** Some UX3405CA configurations have a plain trackpad with **no physical or digital NumberPad LED grid**, even though the touchpad controller (`ASUP*`) exposes an I2C bus.
+> - If your laptop **does not** have a physical NumberPad on the trackpad: you only need the `input` group (`sudo usermod -aG input $USER`) for **Smart Gestures** and **While Typing**. You do **not** need the `i2c` group or `i2c-dev`; any `/dev/i2c-*` warning shown in the NumberPad section is harmless and does not affect Smart Gestures.
+> - If your `UX3405` SKU **does** have the physical 5×4 NumberPad LED grid, follow the full NumberPad Requirements below.
 
 #### NumberPad Requirements
 
-The NumberPad driver runs entirely in-process. It needs unprivileged read/write access to two kernel facilities:
+The NumberPad driver runs entirely in-process (only needed on laptops with physical NumberPad LED hardware). It needs unprivileged read/write access to two kernel facilities:
 
 - **`/dev/i2c-N`** - the touchpad's I2C slave receives a 13-byte magic packet to turn the LED grid on or off.
 - **`/dev/uinput`** - a virtual keyboard emits Numpad keycodes when you tap a cell.
@@ -146,7 +154,7 @@ The NumberPad driver runs entirely in-process. It needs unprivileged read/write 
 
    ```bash
    # If using the AppImage, download the rules file first:
-   wget [https://raw.githubusercontent.com/Traciges/Ayuz/main/packaging/udev/99-ayuz-numberpad.rules](https://raw.githubusercontent.com/Traciges/Ayuz/main/packaging/udev/99-ayuz-numberpad.rules)
+   wget https://raw.githubusercontent.com/scatolo/Ayuz/main/packaging/udev/99-ayuz-numberpad.rules
 
    # Copy it to the system folder and reload udev:
    sudo cp 99-ayuz-numberpad.rules /etc/udev/rules.d/
@@ -185,6 +193,7 @@ If any of these are missing the NumberPad row in the Touchpad page is disabled a
 - **Persistent configuration** - settings are saved to `~/.config/ayuz/config.json` and restored on every launch
 - **Multilingual UI** - English, German, and Brazilian Portuguese supported, switchable at runtime
 - **Toast notifications** - errors and status messages shown as non-blocking toasts
+- **Dynamic hardware telemetry** - automatically discovers battery sysfs entries across `/sys/class/power_supply/*` (not restricted to `BAT0`/`BAT1`) and locates CPU temperature sensors via `/sys/class/hwmon` (`coretemp`, `k10temp`, `zenpower`, or `*cpu*`), falling back to `/sys/class/thermal/thermal_zone0/temp`
 
 ---
 
@@ -201,11 +210,11 @@ Ayuz integrates with several external tools and system services. Install only th
 | `kscreen-doctor`                                           | OLED flicker-free dimming                                        | `kscreen`                     |
 | `iio-sensor-proxy`                                         | Ambient light sensor for auto backlight                          | `iio-sensor-proxy`            |
 | `swayidle`                                                 | Keyboard backlight idle timer                                    | `swayidle`                    |
-| `wpctl`                                                    | PipeWire volume control                                          | bundled with `pipewire-utils` |
+| `wpctl`                                                    | PipeWire volume control (Audio page & Smart Gestures)            | bundled with `pipewire-utils` |
 | `qdbus`                                                    | KDE-specific D-Bus calls (KDE features)                          | `qt6-tools`                   |
 | `kwriteconfig6`                                            | KDE config file access (KDE features)                            | `kf6-kconfig`                 |
 | `gsettings`                                                | Touchpad toggle on GNOME                                         | `glib2`                       |
-| `brightnessctl`                                            | Smart Gestures                                                   | `brightnessctl`               |
+| `brightnessctl`                                            | Smart Gestures brightness fallback (outside GNOME/KDE D-Bus)     | `brightnessctl`               |
 | `playerctl`                                                | Media playback control                                           | `playerctl`                   |
 
 > Features that depend on a missing tool or an incompatible desktop environment are automatically disabled in the UI.
@@ -216,9 +225,8 @@ Ayuz integrates with several external tools and system services. Install only th
 
 The application has been developed and tested on:
 
-- **Laptop:** ASUS Zenbook S16
-- **OS:** Fedora 43
-- **Desktop:** KDE Plasma (Wayland)
+- **ASUS Zenbook S16** · Fedora 43 · KDE Plasma (Wayland) *(upstream)*
+- **ASUS Zenbook 14 OLED (UX3405CA)** · Fedora 44 · GNOME (Wayland) *(UX3405 porting/patch)*
 
 Other ASUS laptops are likely supported to varying degrees. Features relying on `asusd` (battery, fan, FN key) depend on your device being supported by asusctl. Check the [asusctl device support list](https://gitlab.com/asus-linux/asusctl) for compatibility. <br>
 Other Linux distributions should work as long as the relevant dependencies can be installed. Features are individually guarded against missing tools, so the app remains usable even if only some dependencies are available.
@@ -238,6 +246,45 @@ On all other models the AniMatrix section is shown as grayed out.
 ---
 
 ## Installation
+
+### Quick Install (UX3405CA / Fedora 44 GNOME Fork)
+
+Pre-built **`.rpm`**, **`.deb`**, and **`.AppImage`** packages for this porting are automatically published on the [fork's GitHub Releases](https://github.com/scatolo/Ayuz/releases).
+
+1. **Download & install the package for your distribution:**
+   - **Fedora / RPM-based:**
+     ```bash
+     sudo dnf install ./ayuz-1.1.10+ux3405.1-1.x86_64.rpm
+     ```
+   - **Debian / Ubuntu / DEB-based:**
+     ```bash
+     sudo apt install ./ayuz_1.1.10+ux3405.1-1_amd64.deb
+     ```
+   - **AppImage (any distribution):**
+     ```bash
+     chmod +x ayuz-1.1.10-ux3405.1-x86_64.AppImage
+     ./ayuz-1.1.10-ux3405.1-x86_64.AppImage
+     ```
+
+2. **Enable permissions for Touchpad Smart Gestures & While Typing:**
+   ```bash
+   sudo usermod -aG input $USER
+   ```
+   Log out and back in (or reboot) for group membership to take effect.
+   *(Only add `,i2c` — i.e. `sudo usermod -aG i2c,input $USER` — if your laptop physically has the illuminated NumberPad LED grid on the trackpad.)*
+
+3. **Optional runtime tools on Fedora 44 GNOME:**
+   `wpctl` (PipeWire) and GNOME Mutter D-Bus brightness work out of the box. Install optional tools for extra features:
+   ```bash
+   # Battery care (80% limit), fan profiles, FN key mode:
+   sudo dnf copr enable lukenukem/asus-linux
+   sudo dnf install asusctl
+
+   # Media gestures, audio presets, idle keyboard backlight, ambient sensor:
+   sudo dnf install playerctl easyeffects swayidle iio-sensor-proxy
+   ```
+
+---
 
 ### Package Managers:
 
@@ -320,7 +367,7 @@ Add `ayuz` to your `flake.nix` inputs: `ayuz.url = "github:Traciges/Ayuz";`.
 **Fedora:**
 
 ```bash
-sudo dnf install gtk4-devel libadwaita-devel gtk4-layer-shell-devel
+sudo dnf install gcc pkgconf-pkg-config gtk4-devel libadwaita-devel gtk4-layer-shell-devel dbus-devel
 ```
 
 **Arch:**
@@ -354,24 +401,24 @@ sudo dnf install easyeffects iio-sensor-proxy swayidle brightnessctl playerctl
 
 **Manual Download:**
 
-Download the package matching your distribution from the [GitHub Releases](https://github.com/Traciges/ayuz/releases) page:
+Download the package matching your distribution from this fork's [GitHub Releases](https://github.com/scatolo/Ayuz/releases) page (or upstream [Traciges/Ayuz](https://github.com/Traciges/Ayuz/releases) for standard releases):
 
 - **Fedora / RPM-based:**
 
   ```bash
-  sudo dnf install ./ayuz-1.1.10-1.x86_64.rpm
+  sudo dnf install ./ayuz-1.1.10+ux3405.1-1.x86_64.rpm
   ```
 
 - **Debian / Ubuntu / DEB-based:**
 
   ```bash
-  sudo apt install ./ayuz_1.1.10-1_amd64.deb
+  sudo apt install ./ayuz_1.1.10+ux3405.1-1_amd64.deb
   ```
 
 - **AppImage (any distribution):**
   ```bash
-  chmod +x ayuz-1.1.10-1.AppImage
-  ./ayuz-1.1.10-1.AppImage
+  chmod +x ayuz-1.1.10-ux3405.1-x86_64.AppImage
+  ./ayuz-1.1.10-ux3405.1-x86_64.AppImage
   ```
 
 **Note for AppImage users:** Because the AppImage runs without root privileges, it cannot install the necessary hardware permissions for the ASUS NumberPad automatically. If you want to use the NumberPad feature, please follow the manual `udev` rules installation in the NumberPad Requirements section above.
@@ -398,8 +445,8 @@ Download the package matching your distribution from the [GitHub Releases](https
 ### Build from source
 
 ```bash
-git clone https://github.com/Traciges/ayuz
-cd ayuz
+git clone https://github.com/scatolo/Ayuz.git
+cd Ayuz
 cargo build --release
 ./target/release/ayuz
 ```
@@ -407,7 +454,8 @@ cargo build --release
 ### Build an RPM
 
 ```bash
-cargo install cargo-rpm
+cargo install cargo-generate-rpm
+cargo build --release
 cargo generate-rpm
 ```
 
@@ -420,12 +468,12 @@ cargo deb
 
 ### Build an AppImage
 
-Requires [`appimagetool`](https://github.com/AppImage/AppImageKit/releases) on your `$PATH`.
+Requires [`appimagetool`](https://github.com/AppImage/appimagetool/releases) on your `$PATH`.
 
 ```bash
 cargo install cargo-appimage
 cargo appimage
-./target/appimage/ayuz-1.1.6-1.AppImage
+./target/appimage/*.AppImage
 ```
 
 ---
