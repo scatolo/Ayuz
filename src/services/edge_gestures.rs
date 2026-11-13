@@ -105,18 +105,23 @@ fn has_wpctl() -> bool {
 
 /// Returns the program and argument lists needed to adjust volume.
 pub(crate) fn volume_commands(has_wpctl: bool, increase: bool) -> [(&'static str, &'static [&'static str]); 2] {
-    if has_wpctl {
-        let vol_arg = if increase { "5%+" } else { "5%-" };
-        [
+    match (has_wpctl, increase) {
+        (true, true) => [
             ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]),
-            ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", vol_arg]),
-        ]
-    } else {
-        let vol_arg = if increase { "+5%" } else { "-5%" };
-        [
+            ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"]),
+        ],
+        (true, false) => [
+            ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]),
+            ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"]),
+        ],
+        (false, true) => [
             ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"]),
-            ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", vol_arg]),
-        ]
+            ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", "+5%"]),
+        ],
+        (false, false) => [
+            ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"]),
+            ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", "-5%"]),
+        ],
     }
 }
 

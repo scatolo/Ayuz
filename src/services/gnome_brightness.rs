@@ -194,7 +194,10 @@ mod tests {
     #[test]
     fn test_extract_helpers() {
         let mut map = HashMap::new();
-        map.insert("connector".to_string(), OwnedValue::from("eDP-1"));
+        map.insert(
+            "connector".to_string(),
+            Value::from("eDP-1").try_to_owned().unwrap(),
+        );
         map.insert("active".to_string(), OwnedValue::from(true));
         map.insert("min".to_string(), OwnedValue::from(4i32));
         map.insert("max".to_string(), OwnedValue::from(496i32));
