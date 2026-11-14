@@ -8,25 +8,28 @@ Technical reference for the `scatolo/Ayuz` fork (`1.1.10-ux3405.1`), documenting
 
 | Page | Feature | Status on UX3405CA / Fedora 44 GNOME | Backend / Notes |
 | --- | --- | --- | --- |
-| **Home** | Device info & telemetry | Supported | Dynamic sysfs discovery in `src/sys_paths.rs` |
+| **Home** | Device info & telemetry | Supported | Dynamic sysfs discovery in `src/sys_paths.rs`; serial reveal uses `pkexec cat` |
 | **Home** | Profiles | Supported | Persisted in `~/.config/ayuz/config.json` |
-| **Display** | OLED Flicker-Free Dimming | Disabled (KDE only) | Requires `kscreen-doctor` / KDE PowerDevil |
-| **Display** | Color Gamut | **Excluded from scope** (KDE only) | Requires `kscreen-doctor`; intentionally not ported to GNOME |
-| **Display** | Target Mode | Disabled (KDE only) | Requires KWin `diminactive` + `qdbus` / `kwriteconfig6` |
-| **Display** | OLED Pixel Refresh / Panel settings | Disabled (KDE / COSMIC only) | Uses KDE `kwriteconfig6` / `qdbus` or COSMIC panel helpers |
-| **Keyboard** | Auto Backlight | Optional | Requires `iio-sensor-proxy` |
-| **Keyboard** | Backlight Idle | Optional | Requires `swayidle` |
-| **Keyboard** | FN Key Mode & FN+F Hotkey | Optional | Requires `asusd`; `fan_hotkey.rs` listens for keycodes `204`, `425`, `467`, `482` |
-| **Aura / AniMatrix** | RGB / LED Matrix | Hardware-dependent / Grayed out | Zenbook UX3405CA does not have ROG AniMatrix hardware |
-| **Touchpad** | Touchpad Toggle | Supported | `gsettings set org.gnome.desktop.peripherals.touchpad send-events` (`touchpad_ctl.rs`) |
-| **Touchpad** | Smart Gestures | Supported | Requires `input` group; uses `wpctl`, GNOME D-Bus brightness, `playerctl` |
-| **Touchpad** | While Typing | Supported | Requires `input` group; uses `typing_watch.rs` + `touchpad_ctl.rs` |
+| **Display** | OLED Flicker-Free Dimming | Disabled (KDE only) | Requires KDE + `kscreen-doctor` |
+| **Display** | Color Gamut | **Excluded from scope** (KDE only) | Requires KDE + `kscreen-doctor`; intentionally not ported to GNOME |
+| **Display** | Target Mode | Disabled (KDE only) | Requires KWin `diminactive` + `kwriteconfig6` / `qdbus` |
+| **Display** | OLED Pixel Refresh | Disabled (KDE only) | Uses KDE `kwriteconfig6` (`powermanagementprofilesrc`) |
+| **Display** | Panel Auto-Hide & Transparency | Disabled (KDE / COSMIC only) | Uses KDE `qdbus` (`org.kde.plasmashell`) or `cosmic_panel.rs` |
+| **Keyboard** | Auto Backlight | Optional | Requires `iio-sensor-proxy` (`net.hadess.SensorProxy`); checks `logind` lock state |
+| **Keyboard** | Backlight Idle | Optional | Spawns `swayidle` + UPower `KbdBacklight` (`busctl`) |
+| **Keyboard** | FN Key Mode | Optional (Fedora `grubby`) | Checks `grubby`; updates `asus_wmi.fnlock_default` via `pkexec grubby` (reboot required) |
+| **Keyboard** | FN+F Fan Hotkey & OSD | Optional | Requires `asusd` + `input` group; `fan_hotkey.rs` listens for keycodes `204`, `425`, `467`, `482`; `fan_osd.rs` falls back from `gtk4-layer-shell` to an undecorated `gtk::Window` on GNOME Wayland |
+| **Aura** | RGB Keyboard Lighting | Hardware-dependent | Probes `xyz.ljones.Aura` via `asusd` `ObjectManager`; shows info banner if no Aura RGB device is exposed |
+| **AniMatrix** | Lid LED Matrix | Grayed out (ROG only) | Checks `/sys/class/dmi/id/board_name` for ROG AniMatrix models (`GA401*`, `GA402*`, `GU604V`, `G635L`, `G835L`) |
+| **Touchpad** | Touchpad Toggle | Supported | `gsettings set org.gnome.desktop.peripherals.touchpad send-events` (`touchpad_ctl.rs`), 10s safety revert |
+| **Touchpad** | Smart Gestures | Supported | Requires `playerctl` on `$PATH` (UI gate in `gestures.rs`) + `input` group; uses `wpctl` (PipeWire) and GNOME D-Bus brightness |
+| **Touchpad** | While Typing | Supported | `disable_gestures` requires `input` group (`typing_watch.rs`); `disable_touchpad` also uses `gsettings` (`touchpad_ctl.rs`) |
 | **Touchpad** | NumberPad | **SKU-dependent** | Maintainer's UX3405CA SKU has no physical/digital NumberPad LEDs; `UX3405` DMI override (`UX3405MA_5X4` 5×4) applies if LED hardware is present |
-| **Audio** | Volume & Boost (0–150%) | Supported | `wpctl` (`pipewire-utils`) |
-| **Audio** | Sound Profiles | Optional | `easyeffects` + bundled presets in `assets/presets/` |
-| **System** | Battery Care & Fan Profiles | Optional | `asusd` (`xyz.ljones.Asusd`) |
-| **System** | Deep Sleep (`s2idle` / `deep`) | Supported | Reads/writes `/sys/power/mem_sleep` via `pkexec` |
-| **System** | GPU Mode / APU Mem | Optional / Hardware-dependent | `supergfxd` / `asusd` |
+| **Audio** | Volume & Boost (0–150%) | Supported | Reads/sets `@DEFAULT_AUDIO_SINK@` via `wpctl`; optional `pactl subscribe` for live external-change UI sync |
+| **Audio** | Sound Profiles | Optional | Requires `easyeffects`; extracts bundled presets from `assets/presets/` |
+| **System** | Battery Care & Fan Profiles | Optional | Requires `asusd` (`xyz.ljones.Asusd` / `xyz.ljones.Platform`) |
+| **System** | Deep Sleep (`s2idle` / `deep`) | Firmware-dependent | Reads `/sys/power/mem_sleep` directly (enabled only if `deep` is advertised); writes via `pkexec tee` |
+| **System** | GPU Mode / APU Mem | Optional / Hardware-dependent | `supergfxd` (`org.supergfxctl.Daemon`) / `asusd` (`xyz.ljones.AsusArmoury`) |
 
 ---
 
@@ -34,7 +37,7 @@ Technical reference for the `scatolo/Ayuz` fork (`1.1.10-ux3405.1`), documenting
 
 ### 2.1 Dynamic Sysfs Telemetry (`src/sys_paths.rs`, `src/components/home.rs`)
 
-- **Battery discovery**: `find_battery_capacity_paths()` scans `/sys/class/power_supply/*` for entries whose `type` file equals `Battery` (case-insensitive) and includes a `capacity` file, ignoring `Mains` and `USB` supplies and averaging across discovered batteries (`aggregate_battery_percentage()`).
+- **Battery discovery**: `find_battery_capacity_paths()` scans `/sys/class/power_supply/*` (sorted) for entries whose `type` file equals `Battery` (case-insensitive) and includes a `capacity` file, ignoring `Mains` and `USB` supplies and averaging across discovered batteries (`aggregate_battery_percentage()`).
 - **CPU temperature discovery**: `find_cpu_temp_path()` scans `/sys/class/hwmon/*` (sorted) for `name` matching `coretemp` (Intel Core Ultra on UX3405CA), `k10temp`, `zenpower`, or containing `cpu`. It prefers `temp1_input`, falls back to the first `temp*_input`, and finally falls back to `/sys/class/thermal/thermal_zone0/temp`.
 
 ### 2.2 Smart Gestures on GNOME Wayland (`src/services/edge_gestures.rs`, `src/services/gnome_brightness.rs`)
@@ -45,7 +48,7 @@ Technical reference for the `scatolo/Ayuz` fork (`1.1.10-ux3405.1`), documenting
   2. Falls back to `org.gnome.Mutter.DisplayConfig` (`Backlight` property + `SetBacklight(serial, connector, next)`), which handles GNOME 47+ Wayland (including Fedora 44). `calculate_next_backlight()` computes a proportional step across the hardware span (e.g., `4..496` on UX3405CA) with a minimum 1-unit change when `delta_percent != 0`.
   3. Falls back to `brightnessctl set 5%+/-` if D-Bus calls fail.
 - **Top edge (Media)**: Calls `playerctl previous` / `playerctl next`.
-- **UI gating (`src/components/touchpad/gestures.rs`)**: `brightnessctl_available` is treated as satisfied when `is_gnome_desktop() || is_kde_desktop() || which_exists("brightnessctl")`, so GNOME Wayland users do not need `brightnessctl` installed to enable Smart Gestures.
+- **UI gating (`src/components/touchpad/gestures.rs`)**: `brightnessctl_available` is treated as satisfied when `is_gnome_desktop() || is_kde_desktop() || which_exists("brightnessctl")`, so GNOME Wayland users do not need `brightnessctl` installed to enable Smart Gestures (only `playerctl` is checked as a CLI dependency, plus the `input` group at runtime to read `/dev/input/event*`).
 
 ### 2.3 NumberPad & Touchpad-Only UX3405CA SKUs (`src/services/numberpad.rs`, `src/services/numberpad_layouts.rs`)
 
