@@ -148,6 +148,7 @@ jobs:
           strip -s target/release/ayuz
 
       - name: Generate RPM package
+        shell: bash
         env:
           PKG_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
@@ -197,6 +198,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Generate DEB package
+        shell: bash
         env:
           PKG_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
