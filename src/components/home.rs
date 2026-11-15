@@ -170,10 +170,12 @@ async fn fetch_metrics() -> HomeCommandOutput {
         let paths = find_battery_capacity_paths();
         let mut capacities = Vec::new();
         for path in paths {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                if let Ok(val) = content.trim().parse::<u32>() {
-                    capacities.push(val);
-                }
+            if let Some(val) = tokio::fs::read_to_string(&path)
+                .await
+                .ok()
+                .and_then(|content| parse_battery_capacity(&content))
+            {
+                capacities.push(val);
             }
         }
         aggregate_battery_percentage(&capacities)

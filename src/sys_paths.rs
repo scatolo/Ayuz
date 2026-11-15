@@ -22,10 +22,6 @@ pub const SYS_BIOS_VERSION: &str = "/sys/class/dmi/id/bios_version";
 pub const SYS_BIOS_DATE: &str = "/sys/class/dmi/id/bios_date";
 pub const SYS_PRODUCT_SERIAL: &str = "/sys/class/dmi/id/product_serial";
 pub const SYS_POWER_SUPPLY_DIR: &str = "/sys/class/power_supply";
-#[allow(dead_code)]
-pub const SYS_BATTERY0_CAPACITY: &str = "/sys/class/power_supply/BAT0/capacity";
-#[allow(dead_code)]
-pub const SYS_BATTERY1_CAPACITY: &str = "/sys/class/power_supply/BAT1/capacity";
 pub const SYS_LOAD_AVG: &str = "/proc/loadavg";
 pub const SYS_MEM_INFO: &str = "/proc/meminfo";
 pub const SYS_HWMON_DIR: &str = "/sys/class/hwmon";
@@ -62,7 +58,8 @@ pub fn find_battery_capacity_paths() -> Vec<PathBuf> {
 }
 
 /// Dynamically locates all battery capacity sysfs paths under `base_dir`.
-/// Scans entries for a `type` file containing "Battery" (case-insensitive)
+/// Scans entries for a `type` file containing "Battery" (case-insensitive),
+/// skips peripheral batteries whose `scope` file is "Device" (case-insensitive),
 /// and returns the path to `capacity` if present.
 pub fn find_battery_capacity_paths_in(base_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(base_dir) else {
@@ -76,14 +73,20 @@ pub fn find_battery_capacity_paths_in(base_dir: &Path) -> Vec<PathBuf> {
 
     let mut paths = Vec::new();
     for dir in dirs {
-        let type_path = dir.join("type");
-        if let Ok(content) = std::fs::read_to_string(&type_path) {
-            if content.trim().eq_ignore_ascii_case("battery") {
-                let cap_path = dir.join("capacity");
-                if cap_path.exists() {
-                    paths.push(cap_path);
-                }
-            }
+        let Ok(content) = std::fs::read_to_string(dir.join("type")) else {
+            continue;
+        };
+        if !content.trim().eq_ignore_ascii_case("battery") {
+            continue;
+        }
+        if std::fs::read_to_string(dir.join("scope"))
+            .is_ok_and(|scope| scope.trim().eq_ignore_ascii_case("device"))
+        {
+            continue;
+        }
+        let cap_path = dir.join("capacity");
+        if cap_path.exists() {
+            paths.push(cap_path);
         }
     }
 
@@ -147,13 +150,18 @@ pub fn find_cpu_temp_path_in(hwmon_dir: &Path, thermal_fallback_path: &Path) -> 
     thermal_fallback_path.to_path_buf()
 }
 
-/// Aggregates a slice of battery capacity percentages (0-100) into an average percentage string.
-/// Returns "N/A" if the slice is empty.
+/// Parses a raw sysfs battery capacity string into a percentage clamped to `0..=100`.
+pub fn parse_battery_capacity(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().map(|v| v.min(100))
+}
+
+/// Aggregates a slice of battery capacity percentages into an average percentage string,
+/// clamping each entry to `100`. Returns "N/A" if the slice is empty.
 pub fn aggregate_battery_percentage(capacities: &[u32]) -> String {
     if capacities.is_empty() {
         "N/A".to_string()
     } else {
-        let avg = capacities.iter().sum::<u32>() / capacities.len() as u32;
+        let avg = capacities.iter().map(|&c| c.min(100)).sum::<u32>() / capacities.len() as u32;
         format!("{}%", avg)
     }
 }
@@ -286,6 +294,50 @@ mod tests {
         assert!(paths.is_empty());
     }
 
+    #[test]
+    fn test_battery_ignores_device_scope() {
+        let mock = TempMockDir::new("battery_scope");
+
+        let bat0 = mock.path.join("BAT0");
+        fs::create_dir_all(&bat0).unwrap();
+        fs::write(bat0.join("type"), "Battery\n").unwrap();
+        fs::write(bat0.join("scope"), "System\n").unwrap();
+        fs::write(bat0.join("capacity"), "80\n").unwrap();
+
+        let bat1 = mock.path.join("BAT1");
+        fs::create_dir_all(&bat1).unwrap();
+        fs::write(bat1.join("type"), "Battery\n").unwrap();
+        fs::write(bat1.join("capacity"), "60\n").unwrap();
+
+        let bat2 = mock.path.join("BAT2");
+        fs::create_dir_all(&bat2).unwrap();
+        fs::write(bat2.join("type"), "Battery\n").unwrap();
+        fs::write(bat2.join("scope"), "Unknown\n").unwrap();
+        fs::write(bat2.join("capacity"), "70\n").unwrap();
+
+        let mouse = mock.path.join("hidpp_battery_0");
+        fs::create_dir_all(&mouse).unwrap();
+        fs::write(mouse.join("type"), "Battery\n").unwrap();
+        fs::write(mouse.join("scope"), "Device\n").unwrap();
+        fs::write(mouse.join("capacity"), "50\n").unwrap();
+
+        let headset = mock.path.join("headset_battery");
+        fs::create_dir_all(&headset).unwrap();
+        fs::write(headset.join("type"), "Battery\n").unwrap();
+        fs::write(headset.join("scope"), "  device \r\n").unwrap();
+        fs::write(headset.join("capacity"), "30\n").unwrap();
+
+        let paths = find_battery_capacity_paths_in(&mock.path);
+        assert_eq!(
+            paths,
+            vec![
+                bat0.join("capacity"),
+                bat1.join("capacity"),
+                bat2.join("capacity"),
+            ]
+        );
+    }
+
     // --- CPU Temperature Detection Tests ---
 
     #[test]
@@ -397,11 +449,26 @@ mod tests {
     // --- Pure Calculation Helpers Tests ---
 
     #[test]
+    fn test_parse_battery_capacity() {
+        assert_eq!(parse_battery_capacity("85\n"), Some(85));
+        assert_eq!(parse_battery_capacity(" 100 \r\n"), Some(100));
+        assert_eq!(parse_battery_capacity("105\n"), Some(100));
+        assert_eq!(parse_battery_capacity(&u32::MAX.to_string()), Some(100));
+        assert_eq!(parse_battery_capacity("0"), Some(0));
+        assert_eq!(parse_battery_capacity("-5"), None);
+        assert_eq!(parse_battery_capacity("invalid"), None);
+        assert_eq!(parse_battery_capacity(""), None);
+    }
+
+    #[test]
     fn test_aggregate_battery_percentage() {
         assert_eq!(aggregate_battery_percentage(&[]), "N/A");
         assert_eq!(aggregate_battery_percentage(&[85]), "85%");
         assert_eq!(aggregate_battery_percentage(&[80, 60]), "70%");
         assert_eq!(aggregate_battery_percentage(&[0]), "0%");
+        assert_eq!(aggregate_battery_percentage(&[105]), "100%");
+        assert_eq!(aggregate_battery_percentage(&[150, 80]), "90%");
+        assert_eq!(aggregate_battery_percentage(&[u32::MAX, 50]), "75%");
     }
 
     #[test]
