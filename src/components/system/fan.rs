@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use std::time::Duration;
+
 use gtk4 as gtk;
 use relm4::adw;
 use relm4::adw::prelude::*;
@@ -24,6 +26,7 @@ use crate::components::system::fan_osd;
 use crate::services::config::AppConfig;
 use crate::services::dbus;
 use crate::services::dbus::FanProfile;
+use crate::sys_paths::{CpuPowerTelemetry, read_cpu_power_telemetry};
 
 /// Cycles Balanced → Performance → Quiet → Balanced. `LowPower` is treated as
 /// `Quiet` for cycling purposes (TUF laptops); the daemon falls back internally.
@@ -35,12 +38,42 @@ fn next_profile(current: FanProfile) -> FanProfile {
     }
 }
 
+/// Formats read-only CPU EPP, governor, and Intel Turbo Boost telemetry for display.
+/// Returns `None` when none of the sysfs telemetry files are readable on this host.
+pub fn format_cpu_telemetry(tel: &CpuPowerTelemetry) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(epp) = tel.epp.as_deref() {
+        parts.push(t!("fan_cpu_epp", epp = epp).to_string());
+    }
+    if let Some(gov) = tel.governor.as_deref() {
+        parts.push(t!("fan_cpu_governor", governor = gov).to_string());
+    }
+    if let Some(turbo) = tel.turbo_enabled {
+        let state = if turbo {
+            t!("fan_cpu_turbo_on")
+        } else {
+            t!("fan_cpu_turbo_off")
+        };
+        parts.push(t!("fan_cpu_turbo", state = state).to_string());
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
 /// State for the fan profile settings component.
 pub struct FanModel {
     /// Whether the `asusd` daemon is reachable; disables all controls when `false`.
     asusd_available: bool,
     /// The currently active fan profile, used to suppress no-op toggle callbacks.
     current_profile: FanProfile,
+    /// Read-only CPU EPP / governor / Turbo Boost summary.
+    cpu_telemetry_subtitle: String,
+    /// Only show the CPU telemetry row when at least one cpufreq/intel_pstate field exists.
+    cpu_telemetry_available: bool,
     check_performance: gtk::CheckButton,
     check_balanced: gtk::CheckButton,
     check_quiet: gtk::CheckButton,
@@ -55,6 +88,8 @@ pub enum FanMsg {
     LoadProfile(FanProfile),
     /// Cycle to the next profile (triggered by the FN+F global hotkey).
     CycleFromHotkey,
+    /// Refresh read-only CPU EPP / Turbo telemetry from sysfs.
+    RefreshTelemetry,
 }
 
 /// Async command results for the fan profile component.
@@ -66,6 +101,8 @@ pub enum FanCommandOutput {
     InitialProfile(FanProfile),
     /// Confirmation that the profile was successfully applied.
     ProfileSet(FanProfile),
+    /// Read-only CPU EPP / Turbo telemetry snapshot.
+    CpuTelemetryRead(CpuPowerTelemetry),
     /// An error message to forward as a toast notification.
     Error(String),
 }
@@ -115,6 +152,14 @@ impl Component for FanModel {
                 #[watch]
                 set_sensitive: model.asusd_available,
             },
+
+            add = &adw::ActionRow {
+                set_title: &t!("fan_cpu_telemetry_title"),
+                #[watch]
+                set_subtitle: &gtk::glib::markup_escape_text(&model.cpu_telemetry_subtitle),
+                #[watch]
+                set_visible: model.cpu_telemetry_available,
+            },
         }
     }
 
@@ -154,12 +199,24 @@ impl Component for FanModel {
         let model = FanModel {
             asusd_available: false,
             current_profile: saved_profile,
+            cpu_telemetry_subtitle: String::new(),
+            cpu_telemetry_available: false,
             check_performance,
             check_balanced,
             check_quiet,
         };
 
         let widgets = view_output!();
+
+        sender.command(|out, shutdown| {
+            shutdown
+                .register(async move {
+                    if let Ok(tel) = tokio::task::spawn_blocking(read_cpu_power_telemetry).await {
+                        out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                    }
+                })
+                .drop_on_shutdown()
+        });
 
         sender.command(move |out, shutdown| {
             shutdown
@@ -254,6 +311,19 @@ impl Component for FanModel {
                         .drop_on_shutdown()
                 });
             }
+            FanMsg::RefreshTelemetry => {
+                sender.command(|out, shutdown| {
+                    shutdown
+                        .register(async move {
+                            if let Ok(tel) =
+                                tokio::task::spawn_blocking(read_cpu_power_telemetry).await
+                            {
+                                out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                            }
+                        })
+                        .drop_on_shutdown()
+                });
+            }
         }
     }
 
@@ -284,10 +354,53 @@ impl Component for FanModel {
                 tracing::info!("{}", t!("fan_profile_set", profile = name));
                 self.current_profile = profile;
                 fan_osd::show(profile, AppConfig::load().fan_osd_enabled);
+
+                // power-profiles-daemon updates EPP slightly asynchronously after asusd switches profile.
+                sender.command(|out, shutdown| {
+                    shutdown
+                        .register(async move {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            if let Ok(tel) =
+                                tokio::task::spawn_blocking(read_cpu_power_telemetry).await
+                            {
+                                out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                            }
+                        })
+                        .drop_on_shutdown()
+                });
+            }
+            FanCommandOutput::CpuTelemetryRead(tel) => {
+                if let Some(summary) = format_cpu_telemetry(&tel) {
+                    self.cpu_telemetry_subtitle = summary;
+                    self.cpu_telemetry_available = true;
+                } else {
+                    self.cpu_telemetry_available = false;
+                }
             }
             FanCommandOutput::Error(e) => {
                 let _ = sender.output(e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_cpu_telemetry_empty_and_populated() {
+        let empty = CpuPowerTelemetry::default();
+        assert_eq!(format_cpu_telemetry(&empty), None);
+
+        let populated = CpuPowerTelemetry {
+            epp: Some("balance_performance".to_string()),
+            governor: Some("powersave".to_string()),
+            turbo_enabled: Some(true),
+        };
+        let formatted = format_cpu_telemetry(&populated).expect("should format telemetry");
+        assert!(formatted.contains("balance_performance"));
+        assert!(formatted.contains("powersave"));
+        assert!(formatted.contains(&t!("fan_cpu_turbo_on").to_string()));
     }
 }

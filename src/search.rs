@@ -81,6 +81,20 @@ static SEARCH_INDEX: &[SearchItem] = &[
     },
     // Display
     SearchItem {
+        title_key: "refresh_rate_group_title",
+        page_icon: "video-display-symbolic",
+        page_title_key: "tab_display",
+        page_name: "display",
+        component_key: "refresh_rate",
+    },
+    SearchItem {
+        title_key: "refresh_rate_title",
+        page_icon: "video-display-symbolic",
+        page_title_key: "tab_display",
+        page_name: "display",
+        component_key: "refresh_rate",
+    },
+    SearchItem {
         title_key: "oled_dimming_group_title",
         page_icon: "video-display-symbolic",
         page_title_key: "tab_display",
@@ -124,6 +138,20 @@ static SEARCH_INDEX: &[SearchItem] = &[
     },
     SearchItem {
         title_key: "oled_care_transparency_title",
+        page_icon: "video-display-symbolic",
+        page_title_key: "tab_display",
+        page_name: "display",
+        component_key: "oled_care",
+    },
+    SearchItem {
+        title_key: "oled_care_screen_blank_title",
+        page_icon: "video-display-symbolic",
+        page_title_key: "tab_display",
+        page_name: "display",
+        component_key: "oled_care",
+    },
+    SearchItem {
+        title_key: "oled_care_ambient_brightness_title",
         page_icon: "video-display-symbolic",
         page_title_key: "tab_display",
         page_name: "display",
@@ -311,7 +339,14 @@ static SEARCH_INDEX: &[SearchItem] = &[
     },
     // System
     SearchItem {
-        title_key: "battery_maintenance_title",
+        title_key: "battery_status_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "battery",
+    },
+    SearchItem {
+        title_key: "battery_limit_title",
         page_icon: "preferences-system-symbolic",
         page_title_key: "tab_system",
         page_name: "system",
@@ -333,6 +368,13 @@ static SEARCH_INDEX: &[SearchItem] = &[
     },
     SearchItem {
         title_key: "fan_group_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "fan",
+    },
+    SearchItem {
+        title_key: "fan_cpu_telemetry_title",
         page_icon: "preferences-system-symbolic",
         page_title_key: "tab_system",
         page_name: "system",
@@ -372,6 +414,13 @@ static SEARCH_INDEX: &[SearchItem] = &[
         page_title_key: "tab_system",
         page_name: "system",
         component_key: "apu_mem",
+    },
+    SearchItem {
+        title_key: "armoury_group_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "armoury",
     },
 ];
 

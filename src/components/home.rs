@@ -167,6 +167,19 @@ fn metric_card(icon_name: &str, title: &str) -> (gtk::Box, gtk::Label) {
     (card, value_label)
 }
 
+fn format_battery_card(tel: Option<&BatteryTelemetry>) -> String {
+    let Some(tel) = tel else {
+        return "N/A".to_string();
+    };
+    let Some(pct) = tel.capacity_percent else {
+        return "N/A".to_string();
+    };
+    match tel.power_watts {
+        Some(w) if w >= 0.1 => format!("{pct}% · {w:.1} W"),
+        _ => format!("{pct}%"),
+    }
+}
+
 async fn read_cpu_stat_sample() -> Option<CpuStatSample> {
     let content = tokio::fs::read_to_string(SYS_PROC_STAT).await.ok()?;
     parse_proc_stat(&content)
@@ -180,20 +193,11 @@ async fn fetch_metrics(
         None => read_cpu_stat_sample().await,
     };
 
-    let battery = {
-        let paths = find_battery_capacity_paths();
-        let mut capacities = Vec::new();
-        for path in paths {
-            if let Some(val) = tokio::fs::read_to_string(&path)
-                .await
-                .ok()
-                .and_then(|content| parse_battery_capacity(&content))
-            {
-                capacities.push(val);
-            }
-        }
-        aggregate_battery_percentage(&capacities)
-    };
+    let battery = tokio::task::spawn_blocking(read_battery_telemetry)
+        .await
+        .ok()
+        .flatten();
+    let battery = format_battery_card(battery.as_ref());
 
     if prev_cpu.is_none() && first_cpu.is_some() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -977,5 +981,42 @@ impl HomeModel {
         }
         let add_card = build_add_profile_card(sender);
         self.profiles_flow.append(&add_card);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_battery_card() {
+        assert_eq!(format_battery_card(None), "N/A");
+
+        let no_cap = BatteryTelemetry {
+            capacity_percent: None,
+            status: None,
+            power_watts: Some(10.0),
+            health_percent: None,
+            cycle_count: None,
+        };
+        assert_eq!(format_battery_card(Some(&no_cap)), "N/A");
+
+        let with_watts = BatteryTelemetry {
+            capacity_percent: Some(80),
+            status: Some("Discharging".to_string()),
+            power_watts: Some(11.813),
+            health_percent: Some(93.5),
+            cycle_count: Some(38),
+        };
+        assert_eq!(format_battery_card(Some(&with_watts)), "80% · 11.8 W");
+
+        let idle_watts = BatteryTelemetry {
+            capacity_percent: Some(100),
+            status: Some("Full".to_string()),
+            power_watts: Some(0.02),
+            health_percent: None,
+            cycle_count: None,
+        };
+        assert_eq!(format_battery_card(Some(&idle_watts)), "100%");
     }
 }

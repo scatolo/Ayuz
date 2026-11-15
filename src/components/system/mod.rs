@@ -15,6 +15,7 @@
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
 pub mod apu_mem;
+pub mod armoury;
 pub mod battery;
 pub mod fan;
 pub mod fan_osd;

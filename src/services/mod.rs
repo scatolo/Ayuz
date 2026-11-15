@@ -22,6 +22,7 @@ pub mod edge_gestures;
 pub(crate) mod evdev_runner;
 pub mod fan_hotkey;
 pub mod gnome_brightness;
+pub mod gnome_display;
 pub mod kde_brightness;
 pub mod migration;
 pub mod numberpad;

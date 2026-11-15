@@ -24,6 +24,8 @@ use rust_i18n::t;
 // `#[zbus::proxy(...)]` attributes below.
 pub(crate) const ASUSD_SERVICE: &str = "xyz.ljones.Asusd";
 pub(crate) const AURA_INTERFACE: &str = "xyz.ljones.Aura";
+pub(crate) const ASUS_ARMOURY_INTERFACE: &str = "xyz.ljones.AsusArmoury";
+pub(crate) const ASUS_ARMOURY_PREFIX: &str = "/xyz/ljones/asus_armoury/";
 
 // ── Singleton-proxy helper ───────────────────────────────────────────────────
 //
@@ -409,6 +411,144 @@ pub async fn get_apu_mem_options() -> Result<Vec<i32>, String> {
         .possible_values()
         .await
         .map_err(|e| t!("error_apu_mem_read", error = e.to_string()).to_string())
+}
+
+/// Snapshot of a firmware attribute exported by `asusd` under `/xyz/ljones/asus_armoury/*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmouryAttributeInfo {
+    pub name: String,
+    pub path: String,
+    pub current_value: i32,
+    #[allow(dead_code)]
+    pub default_value: Option<i32>,
+    pub min_value: Option<i32>,
+    pub max_value: Option<i32>,
+    pub possible_values: Vec<i32>,
+}
+
+fn unwrap_zval<'a>(mut val: &'a Value<'a>) -> &'a Value<'a> {
+    while let Value::Value(inner) = val {
+        val = inner;
+    }
+    val
+}
+
+fn zval_to_i32(val: &Value<'_>) -> Option<i32> {
+    match unwrap_zval(val) {
+        Value::I32(v) => Some(*v),
+        Value::U32(v) => i32::try_from(*v).ok(),
+        Value::I16(v) => Some(*v as i32),
+        Value::U16(v) => Some(*v as i32),
+        Value::I64(v) => i32::try_from(*v).ok(),
+        Value::U64(v) => i32::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+fn zval_to_i32_vec(val: &Value<'_>) -> Option<Vec<i32>> {
+    match unwrap_zval(val) {
+        Value::Array(arr) => Some(arr.iter().filter_map(zval_to_i32).collect()),
+        _ => None,
+    }
+}
+
+/// Parses an `xyz.ljones.AsusArmoury` property bag from `ObjectManager::GetManagedObjects`.
+pub fn parse_armoury_properties<'a, I>(path: &str, props: I) -> Option<ArmouryAttributeInfo>
+where
+    I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
+{
+    let name = path.strip_prefix(ASUS_ARMOURY_PREFIX)?.trim();
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+
+    let mut current_value: Option<i32> = None;
+    let mut default_value: Option<i32> = None;
+    let mut min_value: Option<i32> = None;
+    let mut max_value: Option<i32> = None;
+    let mut possible_values: Vec<i32> = Vec::new();
+
+    for (key, ov) in props {
+        let val: &Value<'_> = ov;
+        match key {
+            "CurrentValue" | "current_value" => current_value = zval_to_i32(val),
+            "DefaultValue" | "default_value" => default_value = zval_to_i32(val),
+            "MinValue" | "min_value" => min_value = zval_to_i32(val),
+            "MaxValue" | "max_value" => max_value = zval_to_i32(val),
+            "PossibleValues" | "possible_values" => {
+                if let Some(v) = zval_to_i32_vec(val) {
+                    possible_values = v;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(ArmouryAttributeInfo {
+        name: name.to_string(),
+        path: path.to_string(),
+        current_value: current_value?,
+        default_value,
+        min_value,
+        max_value,
+        possible_values,
+    })
+}
+
+/// Enumerates every `xyz.ljones.AsusArmoury` object exported by `asusd` via
+/// `org.freedesktop.DBus.ObjectManager`, sorted alphabetically by attribute name.
+pub async fn discover_armoury_attributes() -> Result<Vec<ArmouryAttributeInfo>, String> {
+    let conn = system_bus_connection().await?;
+    let om = zbus::fdo::ObjectManagerProxy::builder(&conn)
+        .destination(ASUSD_SERVICE)
+        .map_err(|e| t!("error_dbus_proxy_create", error = e.to_string()).to_string())?
+        .path("/")
+        .map_err(|e| t!("error_dbus_proxy_create", error = e.to_string()).to_string())?
+        .build()
+        .await
+        .map_err(|e| t!("error_dbus_proxy_create", error = e.to_string()).to_string())?;
+
+    let managed = om
+        .get_managed_objects()
+        .await
+        .map_err(|e| t!("error_armoury_read", error = e.to_string()).to_string())?;
+
+    let mut out = Vec::new();
+    for (object_path, ifaces) in managed {
+        let path_str = object_path.as_str();
+        if !path_str.starts_with(ASUS_ARMOURY_PREFIX) {
+            continue;
+        }
+        let Some(props) = ifaces.get(ASUS_ARMOURY_INTERFACE) else {
+            continue;
+        };
+        if let Some(info) =
+            parse_armoury_properties(path_str, props.iter().map(|(k, v)| (k.as_str(), v)))
+        {
+            out.push(info);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Writes `current_value` on a specific `/xyz/ljones/asus_armoury/<attr>` D-Bus object.
+pub async fn set_armoury_value(path: &str, value: i32) -> Result<i32, String> {
+    let conn = system_bus_connection().await?;
+    let object_path = ObjectPath::try_from(path.to_string())
+        .map_err(|e| t!("error_dbus_proxy_create", error = e.to_string()).to_string())?
+        .into_owned();
+    let proxy = AsusArmouryProxy::builder(&conn)
+        .path(object_path)
+        .map_err(|e| t!("error_dbus_proxy_create", error = e.to_string()).to_string())?
+        .build()
+        .await
+        .map_err(|e| t!("error_dbus_proxy_create", error = e.to_string()).to_string())?;
+    proxy
+        .set_current_value(value)
+        .await
+        .map_err(|e| t!("error_armoury_write", error = e.to_string()).to_string())?;
+    Ok(value)
 }
 
 // ── Aura RGB keyboard lighting ───────────────────────────────────────────────
@@ -952,5 +1092,83 @@ mod tests {
         assert_eq!(FanProfile::from(2), FanProfile::Quiet);
         assert_eq!(FanProfile::from(3), FanProfile::LowPower);
         assert_eq!(FanProfile::from(99), FanProfile::Balanced);
+    }
+
+    #[test]
+    fn test_parse_armoury_properties_full() {
+        let cur = OwnedValue::try_from(Value::I32(1)).unwrap();
+        let def = OwnedValue::try_from(Value::I32(0)).unwrap();
+        let min = OwnedValue::try_from(Value::I32(0)).unwrap();
+        let max = OwnedValue::try_from(Value::I32(2)).unwrap();
+        let possible = OwnedValue::try_from(Value::Array(
+            zbus::zvariant::Array::from(vec![0i32, 1, 2]),
+        ))
+        .unwrap();
+
+        let props = [
+            ("CurrentValue", &cur),
+            ("DefaultValue", &def),
+            ("MinValue", &min),
+            ("MaxValue", &max),
+            ("PossibleValues", &possible),
+        ];
+
+        let info = parse_armoury_properties("/xyz/ljones/asus_armoury/charge_mode", props)
+            .expect("should parse valid armoury attributes");
+        assert_eq!(info.name, "charge_mode");
+        assert_eq!(info.path, "/xyz/ljones/asus_armoury/charge_mode");
+        assert_eq!(info.current_value, 1);
+        assert_eq!(info.default_value, Some(0));
+        assert_eq!(info.min_value, Some(0));
+        assert_eq!(info.max_value, Some(2));
+        assert_eq!(info.possible_values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_parse_armoury_properties_handles_u32_and_snake_case() {
+        let cur = OwnedValue::try_from(Value::U32(80)).unwrap();
+        let min = OwnedValue::try_from(Value::U32(15)).unwrap();
+        let max = OwnedValue::try_from(Value::U32(120)).unwrap();
+        let props = [
+            ("current_value", &cur),
+            ("min_value", &min),
+            ("max_value", &max),
+        ];
+
+        let info = parse_armoury_properties("/xyz/ljones/asus_armoury/ppt_pl1_spl", props)
+            .expect("should parse snake_case properties");
+        assert_eq!(info.name, "ppt_pl1_spl");
+        assert_eq!(info.current_value, 80);
+        assert_eq!(info.min_value, Some(15));
+        assert_eq!(info.max_value, Some(120));
+        assert!(info.possible_values.is_empty());
+    }
+
+    #[test]
+    fn test_parse_armoury_properties_rejects_missing_current_or_invalid_path() {
+        let def = OwnedValue::try_from(Value::I32(0)).unwrap();
+        assert!(
+            parse_armoury_properties(
+                "/xyz/ljones/asus_armoury/boot_sound",
+                [("DefaultValue", &def)],
+            )
+            .is_none()
+        );
+
+        let cur = OwnedValue::try_from(Value::I32(1)).unwrap();
+        assert!(
+            parse_armoury_properties("/xyz/ljones/aura/tuf", [("CurrentValue", &cur)]).is_none()
+        );
+        assert!(
+            parse_armoury_properties("/xyz/ljones/asus_armoury/", [("CurrentValue", &cur)])
+                .is_none()
+        );
+        assert!(
+            parse_armoury_properties(
+                "/xyz/ljones/asus_armoury/nested/attr",
+                [("CurrentValue", &cur)]
+            )
+            .is_none()
+        );
     }
 }

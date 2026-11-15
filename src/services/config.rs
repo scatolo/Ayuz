@@ -93,6 +93,12 @@ pub struct Profile {
     pub oled_care_pixel_refresh: bool,
     pub oled_care_panel_autohide: bool,
     pub oled_care_transparency: bool,
+    #[serde(default)]
+    pub display_refresh_hz: Option<u32>,
+    #[serde(default)]
+    pub gnome_screen_blank_secs: Option<u32>,
+    #[serde(default)]
+    pub gnome_ambient_brightness: Option<bool>,
 
     // Audio
     pub audio_profile: u32,
@@ -187,6 +193,9 @@ impl Default for Profile {
             oled_care_pixel_refresh: false,
             oled_care_panel_autohide: false,
             oled_care_transparency: false,
+            display_refresh_hz: None,
+            gnome_screen_blank_secs: None,
+            gnome_ambient_brightness: None,
             audio_profile: 0,
             volume: 100.0,
             kbd_timeout_mode: 0,
@@ -370,5 +379,62 @@ impl AppConfig {
         self.profiles.push(profile);
         self.active_profile_id = id;
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_profile_deserializes_without_new_display_fields() {
+        let legacy_json = r#"{
+            "id": "p1",
+            "name": "Legacy",
+            "fan_profile": 0,
+            "oled_dc_dimming": 100,
+            "target_mode_active": false,
+            "color_profile_index": 0,
+            "oled_care_pixel_refresh": false,
+            "oled_care_panel_autohide": false,
+            "oled_care_transparency": false,
+            "audio_profile": 0,
+            "kbd_timeout_mode": 0,
+            "kbd_timeout_battery_ac_index": 0,
+            "kbd_timeout_battery_only_index": 0,
+            "kbd_brighten_active": false,
+            "kbd_dim_active": false,
+            "kbd_brighten_threshold": 12.0,
+            "kbd_dim_threshold": 35.0,
+            "touchpad_active": true,
+            "input_gestures_active": false,
+            "input_fn_key_locked": false,
+            "battery_deep_sleep_active": false,
+            "gpu_mode": 0,
+            "apu_mem": 0
+        }"#;
+
+        let profile: Profile = serde_json::from_str(legacy_json).expect("valid legacy profile");
+        assert_eq!(profile.display_refresh_hz, None);
+        assert_eq!(profile.gnome_screen_blank_secs, None);
+        assert_eq!(profile.gnome_ambient_brightness, None);
+    }
+
+    #[test]
+    fn test_profile_roundtrip_with_display_fields() {
+        let profile = Profile {
+            id: "eco".to_string(),
+            name: "Eco".to_string(),
+            display_refresh_hz: Some(60),
+            gnome_screen_blank_secs: Some(120),
+            gnome_ambient_brightness: Some(true),
+            ..Profile::default()
+        };
+
+        let serialized = serde_json::to_string(&profile).expect("serialize profile");
+        let parsed: Profile = serde_json::from_str(&serialized).expect("deserialize profile");
+        assert_eq!(parsed.display_refresh_hz, Some(60));
+        assert_eq!(parsed.gnome_screen_blank_secs, Some(120));
+        assert_eq!(parsed.gnome_ambient_brightness, Some(true));
     }
 }

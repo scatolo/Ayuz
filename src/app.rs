@@ -21,12 +21,14 @@ use crate::components::audio::{SoundModesModel, SoundModesMsg, VolumeModel};
 use crate::components::display::ColorGamutModel;
 use crate::components::display::OledCareModel;
 use crate::components::display::OledDimmingModel;
+use crate::components::display::RefreshRateModel;
 use crate::components::display::TargetModeModel;
 use crate::components::home::{HomeModel, HomeMsg, HomeOutput};
 use crate::components::audio::volume::VolumeMsg;
 use crate::components::display::color_gamut::ColorGamutMsg;
 use crate::components::display::oled_care::OledCareMsg;
 use crate::components::display::oled_dimming::OledDimmingMsg;
+use crate::components::display::refresh_rate::RefreshRateMsg;
 use crate::components::display::target_mode::TargetModeMsg;
 use crate::components::keyboard::auto_backlight::AutoBacklightMsg;
 use crate::components::keyboard::auto_backlight::AutoBacklightOutput;
@@ -37,6 +39,7 @@ use crate::components::touchpad::numberpad::NumberpadMsg;
 use crate::components::touchpad::touchpad::TouchpadMsg;
 use crate::components::touchpad::typing::TypingMsg;
 use crate::components::system::apu_mem::ApuMemMsg;
+use crate::components::system::armoury::ArmouryMsg;
 use crate::components::system::battery::BatteryMsg;
 use crate::components::system::fan::FanMsg;
 use crate::components::system::gpu::GpuMsg;
@@ -52,6 +55,7 @@ use crate::components::touchpad::NumberpadModel;
 use crate::components::touchpad::TouchpadModel;
 use crate::components::touchpad::TypingModel;
 use crate::components::system::apu_mem::ApuMemModel;
+use crate::components::system::armoury::ArmouryModel;
 use crate::components::system::battery::BatteryModel;
 use crate::components::system::fan::FanModel;
 use crate::components::system::gpu::GpuModel;
@@ -132,9 +136,11 @@ pub struct AppModel {
     _tray: ksni::Handle<tray::AyuzTray>,
     home: Controller<HomeModel>,
     apu_mem: Controller<ApuMemModel>,
+    armoury: Controller<ArmouryModel>,
     battery: Controller<BatteryModel>,
     fan: Controller<FanModel>,
     gpu: Controller<GpuModel>,
+    refresh_rate: Controller<RefreshRateModel>,
     oled_dimming: Controller<OledDimmingModel>,
     target_mode: Controller<TargetModeModel>,
     oled_care: Controller<OledCareModel>,
@@ -161,6 +167,7 @@ impl AppModel {
     fn distribute_profile(&self, p: &crate::services::config::Profile) {
         // Display
         self.fan.sender().emit(FanMsg::LoadProfile(FanProfile::from(p.fan_profile)));
+        self.refresh_rate.sender().emit(RefreshRateMsg::LoadProfile(p.display_refresh_hz));
         self.oled_dimming.sender().emit(OledDimmingMsg::LoadProfile(p.oled_dc_dimming));
         self.target_mode.sender().emit(TargetModeMsg::LoadProfile(p.target_mode_active));
         self.color_gamut.sender().emit(ColorGamutMsg::LoadProfile(p.color_profile_index));
@@ -168,6 +175,8 @@ impl AppModel {
             pixel_refresh: p.oled_care_pixel_refresh,
             panel_autohide: p.oled_care_panel_autohide,
             transparency: p.oled_care_transparency,
+            gnome_screen_blank_secs: p.gnome_screen_blank_secs,
+            gnome_ambient_brightness: p.gnome_ambient_brightness,
         });
 
         // Audio
@@ -260,6 +269,11 @@ impl SimpleComponent for AppModel {
                     window.present();
                 }
                 self.volume_widget.sender().emit(VolumeMsg::Refresh);
+                self.refresh_rate.sender().emit(RefreshRateMsg::Refresh);
+                self.oled_care.sender().emit(OledCareMsg::Refresh);
+                self.battery.sender().emit(BatteryMsg::RefreshStats);
+                self.fan.sender().emit(FanMsg::RefreshTelemetry);
+                self.armoury.sender().emit(ArmouryMsg::Refresh);
             }
             AppMsg::QuitApp => {
                 relm4::main_application().quit();
@@ -345,9 +359,11 @@ impl SimpleComponent for AppModel {
                 HomeOutput::ActivateProfile(id) => AppMsg::ActivateProfile(id),
             });
         let apu_mem = launch_component!(ApuMemModel, sender);
+        let armoury = launch_component!(ArmouryModel, sender);
         let battery = launch_component!(BatteryModel, sender);
         let fan = launch_component!(FanModel, sender);
         let gpu = launch_component!(GpuModel, sender);
+        let refresh_rate = launch_component!(RefreshRateModel, sender);
         let oled_dimming = launch_component!(OledDimmingModel, sender);
         let target_mode = launch_component!(TargetModeModel, sender);
         let oled_care = launch_component!(OledCareModel, sender);
@@ -428,9 +444,11 @@ impl SimpleComponent for AppModel {
             _tray: tray_handle,
             home,
             apu_mem,
+            armoury,
             battery,
             fan,
             gpu,
+            refresh_rate,
             oled_dimming,
             target_mode,
             oled_care,
@@ -450,9 +468,11 @@ impl SimpleComponent for AppModel {
 
         let home_widget = model.home.widget();
         let apu_mem_widget = model.apu_mem.widget();
+        let armoury_widget = model.armoury.widget();
         let battery_widget = model.battery.widget();
         let fan_widget = model.fan.widget();
         let gpu_widget = model.gpu.widget();
+        let refresh_rate_widget = model.refresh_rate.widget();
         let oled_dimming_widget = model.oled_dimming.widget();
         let target_mode_widget = model.target_mode.widget();
         let oled_care_widget = model.oled_care.widget();
@@ -472,6 +492,7 @@ impl SimpleComponent for AppModel {
         // Content pages
 
         let display_page = adw::PreferencesPage::new();
+        display_page.add(refresh_rate_widget);
         display_page.add(oled_dimming_widget);
         display_page.add(target_mode_widget);
         display_page.add(oled_care_widget);
@@ -526,6 +547,7 @@ impl SimpleComponent for AppModel {
         system_page.add(fan_widget);
         system_page.add(gpu_widget);
         system_page.add(apu_mem_widget);
+        system_page.add(armoury_widget);
 
         let lang_group = build_language_and_autostart_group(&sender);
         system_page.add(&lang_group);
@@ -537,6 +559,10 @@ impl SimpleComponent for AppModel {
 
         let widget_map = std::collections::HashMap::from([
             ("home_info", home_widget.clone().upcast::<gtk4::Widget>()),
+            (
+                "refresh_rate",
+                refresh_rate_widget.clone().upcast::<gtk4::Widget>(),
+            ),
             (
                 "oled_dimming",
                 oled_dimming_widget.clone().upcast::<gtk4::Widget>(),
@@ -574,6 +600,7 @@ impl SimpleComponent for AppModel {
                 sound_modes_widget.clone().upcast::<gtk4::Widget>(),
             ),
             ("apu_mem", apu_mem_widget.clone().upcast::<gtk4::Widget>()),
+            ("armoury", armoury_widget.clone().upcast::<gtk4::Widget>()),
             ("battery", battery_widget.clone().upcast::<gtk4::Widget>()),
             ("fan", fan_widget.clone().upcast::<gtk4::Widget>()),
             (
@@ -604,9 +631,26 @@ impl SimpleComponent for AppModel {
         content_stack.set_visible_child_name(AppPage::Home.as_str());
 
         let vol_sender = model.volume_widget.sender().clone();
+        let refresh_rate_sender = model.refresh_rate.sender().clone();
+        let oled_care_sender = model.oled_care.sender().clone();
+        let battery_sender = model.battery.sender().clone();
+        let fan_telemetry_sender = model.fan.sender().clone();
+        let armoury_sender = model.armoury.sender().clone();
         content_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
-            if stack.visible_child_name().as_deref() == Some(AppPage::Audio.as_str()) {
-                vol_sender.emit(VolumeMsg::Refresh);
+            match stack.visible_child_name().as_deref() {
+                Some(name) if name == AppPage::Audio.as_str() => {
+                    vol_sender.emit(VolumeMsg::Refresh);
+                }
+                Some(name) if name == AppPage::Display.as_str() => {
+                    refresh_rate_sender.emit(RefreshRateMsg::Refresh);
+                    oled_care_sender.emit(OledCareMsg::Refresh);
+                }
+                Some(name) if name == AppPage::System.as_str() => {
+                    battery_sender.emit(BatteryMsg::RefreshStats);
+                    fan_telemetry_sender.emit(FanMsg::RefreshTelemetry);
+                    armoury_sender.emit(ArmouryMsg::Refresh);
+                }
+                _ => {}
             }
         });
 

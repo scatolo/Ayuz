@@ -27,6 +27,11 @@ pub const SYS_MEM_INFO: &str = "/proc/meminfo";
 pub const SYS_HWMON_DIR: &str = "/sys/class/hwmon";
 pub const SYS_THERMAL_ZONE0_TEMP: &str = "/sys/class/thermal/thermal_zone0/temp";
 pub const SYS_MEM_SLEEP: &str = "/sys/power/mem_sleep";
+pub const SYS_CPU_EPP: &str = "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference";
+pub const SYS_CPU_GOVERNOR: &str = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor";
+pub const SYS_INTEL_NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
+pub const SYS_ASUS_ARMOURY_ATTRS_DIR: &str =
+    "/sys/class/firmware-attributes/asus-armoury/attributes";
 pub const DEV_UINPUT: &str = "/dev/uinput";
 pub const PROC_BUS_INPUT_DEVICES: &str = "/proc/bus/input/devices";
 
@@ -52,16 +57,10 @@ pub fn anime_assets_dir() -> PathBuf {
         .join("share/ayuz/anime")
 }
 
-/// Dynamically locates all battery capacity sysfs paths under `SYS_POWER_SUPPLY_DIR`.
-pub fn find_battery_capacity_paths() -> Vec<PathBuf> {
-    find_battery_capacity_paths_in(Path::new(SYS_POWER_SUPPLY_DIR))
-}
-
-/// Dynamically locates all battery capacity sysfs paths under `base_dir`.
-/// Scans entries for a `type` file containing "Battery" (case-insensitive),
-/// skips peripheral batteries whose `scope` file is "Device" (case-insensitive),
-/// and returns the path to `capacity` if present.
-pub fn find_battery_capacity_paths_in(base_dir: &Path) -> Vec<PathBuf> {
+/// Dynamically locates all system battery directories under `base_dir`.
+/// Scans entries for a `type` file containing "Battery" (case-insensitive)
+/// and skips peripheral batteries whose `scope` file is "Device" (case-insensitive).
+pub fn find_battery_dirs_in(base_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(base_dir) else {
         return Vec::new();
     };
@@ -71,7 +70,7 @@ pub fn find_battery_capacity_paths_in(base_dir: &Path) -> Vec<PathBuf> {
         .collect();
     dirs.sort();
 
-    let mut paths = Vec::new();
+    let mut result = Vec::new();
     for dir in dirs {
         let Ok(content) = std::fs::read_to_string(dir.join("type")) else {
             continue;
@@ -84,13 +83,29 @@ pub fn find_battery_capacity_paths_in(base_dir: &Path) -> Vec<PathBuf> {
         {
             continue;
         }
-        let cap_path = dir.join("capacity");
-        if cap_path.exists() {
-            paths.push(cap_path);
-        }
+        result.push(dir);
     }
 
-    paths
+    result
+}
+
+/// Dynamically locates all battery capacity sysfs paths under `SYS_POWER_SUPPLY_DIR`.
+#[allow(dead_code)]
+pub fn find_battery_capacity_paths() -> Vec<PathBuf> {
+    find_battery_capacity_paths_in(Path::new(SYS_POWER_SUPPLY_DIR))
+}
+
+/// Dynamically locates all battery capacity sysfs paths under `base_dir`.
+/// Scans entries for a `type` file containing "Battery" (case-insensitive),
+/// skips peripheral batteries whose `scope` file is "Device" (case-insensitive),
+/// and returns the path to `capacity` if present.
+#[allow(dead_code)]
+pub fn find_battery_capacity_paths_in(base_dir: &Path) -> Vec<PathBuf> {
+    find_battery_dirs_in(base_dir)
+        .into_iter()
+        .map(|dir| dir.join("capacity"))
+        .filter(|cap_path| cap_path.exists())
+        .collect()
 }
 
 /// Dynamically locates the CPU temperature sysfs path from `/sys/class/hwmon`,
@@ -157,6 +172,7 @@ pub fn parse_battery_capacity(raw: &str) -> Option<u32> {
 
 /// Aggregates a slice of battery capacity percentages into an average percentage string,
 /// clamping each entry to `100`. Returns "N/A" if the slice is empty.
+#[allow(dead_code)]
 pub fn aggregate_battery_percentage(capacities: &[u32]) -> String {
     if capacities.is_empty() {
         "N/A".to_string()
@@ -233,6 +249,183 @@ pub fn calculate_cpu_usage_percent(prev: CpuStatSample, curr: CpuStatSample) -> 
         .round()
         .clamp(0.0, 100.0) as u32;
     Some(pct)
+}
+
+/// Aggregated battery telemetry read from `/sys/class/power_supply/BAT*`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatteryTelemetry {
+    pub capacity_percent: Option<u32>,
+    pub status: Option<String>,
+    pub power_watts: Option<f64>,
+    pub health_percent: Option<f64>,
+    pub cycle_count: Option<u32>,
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn read_u64(path: &Path) -> Option<u64> {
+    read_trimmed(path)?.parse::<u64>().ok()
+}
+
+fn read_i64(path: &Path) -> Option<i64> {
+    read_trimmed(path)?.parse::<i64>().ok()
+}
+
+/// Parses battery telemetry from a single `/sys/class/power_supply/BAT*` directory.
+pub fn parse_battery_dir(dir: &Path) -> BatteryTelemetry {
+    let capacity_percent = read_trimmed(&dir.join("capacity")).and_then(|s| parse_battery_capacity(&s));
+    let status = read_trimmed(&dir.join("status"));
+
+    let power_watts = if let Some(pw_uw) = read_i64(&dir.join("power_now")) {
+        Some(pw_uw.unsigned_abs() as f64 / 1_000_000.0)
+    } else if let (Some(curr_ua), Some(volt_uv)) = (
+        read_i64(&dir.join("current_now")),
+        read_u64(&dir.join("voltage_now")),
+    ) {
+        Some((curr_ua.unsigned_abs() as f64 * volt_uv as f64) / 1_000_000_000_000.0)
+    } else {
+        None
+    };
+
+    let health_percent = if let (Some(full), Some(design)) = (
+        read_u64(&dir.join("energy_full")),
+        read_u64(&dir.join("energy_full_design")),
+    ) && design > 0
+    {
+        Some(((full as f64 / design as f64) * 100.0).clamp(0.0, 100.0))
+    } else if let (Some(full), Some(design)) = (
+        read_u64(&dir.join("charge_full")),
+        read_u64(&dir.join("charge_full_design")),
+    ) && design > 0
+    {
+        Some(((full as f64 / design as f64) * 100.0).clamp(0.0, 100.0))
+    } else {
+        None
+    };
+
+    let cycle_count = read_trimmed(&dir.join("cycle_count")).and_then(|s| s.parse::<u32>().ok());
+
+    BatteryTelemetry {
+        capacity_percent,
+        status,
+        power_watts,
+        health_percent,
+        cycle_count,
+    }
+}
+
+/// Reads and aggregates telemetry for all system batteries under `SYS_POWER_SUPPLY_DIR`.
+pub fn read_battery_telemetry() -> Option<BatteryTelemetry> {
+    read_battery_telemetry_in(Path::new(SYS_POWER_SUPPLY_DIR))
+}
+
+/// Reads and aggregates telemetry for all system batteries under `base_dir`.
+pub fn read_battery_telemetry_in(base_dir: &Path) -> Option<BatteryTelemetry> {
+    let dirs = find_battery_dirs_in(base_dir);
+    if dirs.is_empty() {
+        return None;
+    }
+
+    let entries: Vec<BatteryTelemetry> = dirs.iter().map(|d| parse_battery_dir(d)).collect();
+
+    let caps: Vec<u32> = entries.iter().filter_map(|e| e.capacity_percent).collect();
+    let capacity_percent = if caps.is_empty() {
+        None
+    } else {
+        Some(caps.iter().sum::<u32>() / caps.len() as u32)
+    };
+
+    let status = entries
+        .iter()
+        .filter_map(|e| e.status.as_ref())
+        .find(|s| !s.eq_ignore_ascii_case("unknown"))
+        .cloned()
+        .or_else(|| entries.iter().find_map(|e| e.status.clone()));
+
+    let watts: Vec<f64> = entries.iter().filter_map(|e| e.power_watts).collect();
+    let power_watts = if watts.is_empty() {
+        None
+    } else {
+        Some(watts.iter().sum())
+    };
+
+    let healths: Vec<f64> = entries.iter().filter_map(|e| e.health_percent).collect();
+    let health_percent = if healths.is_empty() {
+        None
+    } else {
+        Some(healths.iter().sum::<f64>() / healths.len() as f64)
+    };
+
+    let cycle_count = entries.iter().find_map(|e| e.cycle_count);
+
+    Some(BatteryTelemetry {
+        capacity_percent,
+        status,
+        power_watts,
+        health_percent,
+        cycle_count,
+    })
+}
+
+/// Read-only CPU power/EPP telemetry from `cpufreq` / `intel_pstate`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CpuPowerTelemetry {
+    pub epp: Option<String>,
+    pub governor: Option<String>,
+    pub turbo_enabled: Option<bool>,
+}
+
+/// Parses `/sys/devices/system/cpu/intel_pstate/no_turbo` (`"0"` = enabled, `"1"` = disabled).
+pub fn parse_no_turbo(raw: &str) -> Option<bool> {
+    match raw.trim() {
+        "0" => Some(true),
+        "1" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads read-only CPU EPP, governor, and `intel_pstate` Turbo Boost status from the live sysfs paths.
+pub fn read_cpu_power_telemetry() -> CpuPowerTelemetry {
+    read_cpu_power_telemetry_in(
+        Path::new(SYS_CPU_EPP),
+        Path::new(SYS_CPU_GOVERNOR),
+        Path::new(SYS_INTEL_NO_TURBO),
+    )
+}
+
+/// Reads CPU power telemetry from arbitrary paths (for headless unit testing).
+pub fn read_cpu_power_telemetry_in(
+    epp_path: &Path,
+    governor_path: &Path,
+    no_turbo_path: &Path,
+) -> CpuPowerTelemetry {
+    CpuPowerTelemetry {
+        epp: read_trimmed(epp_path),
+        governor: read_trimmed(governor_path),
+        turbo_enabled: read_trimmed(no_turbo_path).and_then(|s| parse_no_turbo(&s)),
+    }
+}
+
+/// Checks whether an `asus-armoury` firmware attribute's `current_value` file has owner write permission.
+///
+/// Attributes like `charge_mode` on UX3405CA are exposed read-only (`0444`) by the kernel driver;
+/// returning `false` lets the UI render them as read-only info rows instead of broken controls.
+pub fn is_armoury_attr_writable(attr_name: &str) -> bool {
+    is_armoury_attr_writable_in(Path::new(SYS_ASUS_ARMOURY_ATTRS_DIR), attr_name)
+}
+
+/// Path-parameterized version of [`is_armoury_attr_writable`] for unit testing.
+pub fn is_armoury_attr_writable_in(base_dir: &Path, attr_name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = base_dir.join(attr_name).join("current_value");
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o200 != 0)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -630,5 +823,129 @@ cpu1 71 0 89 118089 151 12 2 0 0 0
             idle_all: 799,
         };
         assert_eq!(calculate_cpu_usage_percent(s1, iowait_quirk), Some(100));
+    }
+
+    // --- Battery Telemetry Tests ---
+
+    #[test]
+    fn test_battery_telemetry_energy_and_power_now() {
+        let mock = TempMockDir::new("bat_tel_ux3405");
+        let bat0 = mock.path.join("BAT0");
+        fs::create_dir_all(&bat0).unwrap();
+        fs::write(bat0.join("type"), "Battery\n").unwrap();
+        fs::write(bat0.join("capacity"), "79\n").unwrap();
+        fs::write(bat0.join("status"), "Discharging\n").unwrap();
+        fs::write(bat0.join("power_now"), "11813000\n").unwrap();
+        fs::write(bat0.join("energy_full"), "70216000\n").unwrap();
+        fs::write(bat0.join("energy_full_design"), "75086000\n").unwrap();
+        fs::write(bat0.join("cycle_count"), "38\n").unwrap();
+
+        let tel = read_battery_telemetry_in(&mock.path).expect("telemetry present");
+        assert_eq!(tel.capacity_percent, Some(79));
+        assert_eq!(tel.status.as_deref(), Some("Discharging"));
+        let w = tel.power_watts.expect("power_watts");
+        assert!((w - 11.813).abs() < 1e-6);
+        let h = tel.health_percent.expect("health_percent");
+        assert!((h - (70216000.0 / 75086000.0 * 100.0)).abs() < 1e-6);
+        assert_eq!(tel.cycle_count, Some(38));
+    }
+
+    #[test]
+    fn test_battery_telemetry_current_voltage_and_charge_fallback() {
+        let mock = TempMockDir::new("bat_tel_fallback");
+        let bat0 = mock.path.join("BAT0");
+        fs::create_dir_all(&bat0).unwrap();
+        fs::write(bat0.join("type"), "Battery\n").unwrap();
+        fs::write(bat0.join("capacity"), "50\n").unwrap();
+        fs::write(bat0.join("status"), "Charging\n").unwrap();
+        fs::write(bat0.join("current_now"), "-2000000\n").unwrap();
+        fs::write(bat0.join("voltage_now"), "12000000\n").unwrap();
+        fs::write(bat0.join("charge_full"), "4800000\n").unwrap();
+        fs::write(bat0.join("charge_full_design"), "5000000\n").unwrap();
+
+        let tel = read_battery_telemetry_in(&mock.path).expect("telemetry present");
+        assert_eq!(tel.capacity_percent, Some(50));
+        assert_eq!(tel.status.as_deref(), Some("Charging"));
+        assert!((tel.power_watts.unwrap() - 24.0).abs() < 1e-6);
+        assert!((tel.health_percent.unwrap() - 96.0).abs() < 1e-6);
+        assert_eq!(tel.cycle_count, None);
+    }
+
+    #[test]
+    fn test_battery_telemetry_ignores_device_and_handles_zero_design() {
+        let mock = TempMockDir::new("bat_tel_edge");
+        let mouse = mock.path.join("hidpp_battery_0");
+        fs::create_dir_all(&mouse).unwrap();
+        fs::write(mouse.join("type"), "Battery\n").unwrap();
+        fs::write(mouse.join("scope"), "Device\n").unwrap();
+        fs::write(mouse.join("capacity"), "90\n").unwrap();
+
+        assert_eq!(read_battery_telemetry_in(&mock.path), None);
+
+        let bat0 = mock.path.join("BAT0");
+        fs::create_dir_all(&bat0).unwrap();
+        fs::write(bat0.join("type"), "Battery\n").unwrap();
+        fs::write(bat0.join("energy_full"), "5000\n").unwrap();
+        fs::write(bat0.join("energy_full_design"), "0\n").unwrap();
+        fs::write(bat0.join("cycle_count"), "-1\n").unwrap();
+
+        let tel = read_battery_telemetry_in(&mock.path).expect("BAT0 present");
+        assert_eq!(tel.health_percent, None);
+        assert_eq!(tel.cycle_count, None);
+    }
+
+    // --- CPU Power Telemetry & Armoury Permission Tests ---
+
+    #[test]
+    fn test_parse_no_turbo() {
+        assert_eq!(parse_no_turbo("0\n"), Some(true));
+        assert_eq!(parse_no_turbo("1\n"), Some(false));
+        assert_eq!(parse_no_turbo("2"), None);
+        assert_eq!(parse_no_turbo(""), None);
+    }
+
+    #[test]
+    fn test_read_cpu_power_telemetry_in() {
+        let mock = TempMockDir::new("cpu_tel");
+        let epp = mock.path.join("epp");
+        let gov = mock.path.join("gov");
+        let no_turbo = mock.path.join("no_turbo");
+        fs::write(&epp, "balance_performance\n").unwrap();
+        fs::write(&gov, "powersave\n").unwrap();
+        fs::write(&no_turbo, "0\n").unwrap();
+
+        let tel = read_cpu_power_telemetry_in(&epp, &gov, &no_turbo);
+        assert_eq!(tel.epp.as_deref(), Some("balance_performance"));
+        assert_eq!(tel.governor.as_deref(), Some("powersave"));
+        assert_eq!(tel.turbo_enabled, Some(true));
+
+        let missing = read_cpu_power_telemetry_in(
+            &mock.path.join("missing_epp"),
+            &mock.path.join("missing_gov"),
+            &mock.path.join("missing_turbo"),
+        );
+        assert_eq!(missing, CpuPowerTelemetry::default());
+    }
+
+    #[test]
+    fn test_is_armoury_attr_writable_in() {
+        use std::os::unix::fs::PermissionsExt;
+        let mock = TempMockDir::new("armoury_perms");
+        let ro_dir = mock.path.join("charge_mode");
+        let rw_dir = mock.path.join("boot_sound");
+        fs::create_dir_all(&ro_dir).unwrap();
+        fs::create_dir_all(&rw_dir).unwrap();
+
+        let ro_file = ro_dir.join("current_value");
+        let rw_file = rw_dir.join("current_value");
+        fs::write(&ro_file, "0\n").unwrap();
+        fs::write(&rw_file, "1\n").unwrap();
+
+        fs::set_permissions(&ro_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&rw_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!is_armoury_attr_writable_in(&mock.path, "charge_mode"));
+        assert!(is_armoury_attr_writable_in(&mock.path, "boot_sound"));
+        assert!(!is_armoury_attr_writable_in(&mock.path, "nonexistent"));
     }
 }
