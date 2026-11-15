@@ -22,7 +22,7 @@ use crate::components::display::ColorGamutModel;
 use crate::components::display::OledCareModel;
 use crate::components::display::OledDimmingModel;
 use crate::components::display::TargetModeModel;
-use crate::components::home::{HomeModel, HomeOutput};
+use crate::components::home::{HomeModel, HomeMsg, HomeOutput};
 use crate::components::audio::volume::VolumeMsg;
 use crate::components::display::color_gamut::ColorGamutMsg;
 use crate::components::display::oled_care::OledCareMsg;
@@ -339,7 +339,7 @@ impl SimpleComponent for AppModel {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let home = HomeModel::builder()
-            .launch(())
+            .launch(!init)
             .forward(sender.input_sender(), |msg| match msg {
                 HomeOutput::Error(e) => AppMsg::Error(e),
                 HomeOutput::ActivateProfile(id) => AppMsg::ActivateProfile(id),
@@ -748,14 +748,48 @@ impl SimpleComponent for AppModel {
 
         root.set_hide_on_close(true);
 
+        // Pause Home metrics polling while the window is hidden (`--hidden` or closed to tray)
+        // or while another tab is active, and resume immediately when Home becomes visible.
+        // `suppress_initial_present` prevents Relm4's initial `present()` call before
+        // `idle_add_local_once` hides a `--hidden` window from triggering a spurious cycle.
+        let suppress_initial_present = Rc::new(std::cell::Cell::new(init));
+        let update_home_polling: Rc<dyn Fn()> = {
+            let home_sender = model.home.sender().clone();
+            let win_weak = root.downgrade();
+            let stack_weak = content_stack.downgrade();
+            let suppress = suppress_initial_present.clone();
+            Rc::new(move || {
+                if suppress.get() {
+                    return;
+                }
+                let active = win_weak
+                    .upgrade()
+                    .is_some_and(|w| w.is_visible())
+                    && stack_weak.upgrade().is_some_and(|s| {
+                        s.visible_child_name().as_deref() == Some(AppPage::Home.as_str())
+                    });
+                home_sender.emit(HomeMsg::SetPollingActive(active));
+            })
+        };
+        {
+            let update = update_home_polling.clone();
+            root.connect_visible_notify(move |_| update());
+        }
+        {
+            let update = update_home_polling;
+            content_stack.connect_notify_local(Some("visible-child-name"), move |_, _| update());
+        }
+
         // Relm4 calls window.present() internally after init() completes, which
         // overrides set_visible: false and forces the window to show. We schedule
         // a hide in the same GTK frame via idle_add_local_once so the window is
         // invisible again before a single pixel is drawn to the screen.
         if init {
             let win = root.clone();
+            let suppress = suppress_initial_present;
             gtk4::glib::idle_add_local_once(move || {
                 win.set_visible(false);
+                suppress.set(false);
             });
         }
 

@@ -22,7 +22,7 @@ pub const SYS_BIOS_VERSION: &str = "/sys/class/dmi/id/bios_version";
 pub const SYS_BIOS_DATE: &str = "/sys/class/dmi/id/bios_date";
 pub const SYS_PRODUCT_SERIAL: &str = "/sys/class/dmi/id/product_serial";
 pub const SYS_POWER_SUPPLY_DIR: &str = "/sys/class/power_supply";
-pub const SYS_LOAD_AVG: &str = "/proc/loadavg";
+pub const SYS_PROC_STAT: &str = "/proc/stat";
 pub const SYS_MEM_INFO: &str = "/proc/meminfo";
 pub const SYS_HWMON_DIR: &str = "/sys/class/hwmon";
 pub const SYS_THERMAL_ZONE0_TEMP: &str = "/sys/class/thermal/thermal_zone0/temp";
@@ -170,6 +170,69 @@ pub fn aggregate_battery_percentage(capacities: &[u32]) -> String {
 pub fn format_cpu_temp(raw_millideg: &str) -> String {
     let millideg: i32 = raw_millideg.trim().parse().unwrap_or(0);
     format!("{}°C", millideg / 1000)
+}
+
+/// Snapshot of cumulative CPU jiffies parsed from the aggregate `cpu` line of `/proc/stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuStatSample {
+    pub total: u64,
+    pub idle_all: u64,
+}
+
+/// Parses the aggregate `cpu` row of `/proc/stat` into cumulative total and idle jiffies.
+///
+/// Linux `/proc/stat` columns are: `user nice system idle iowait irq softirq steal [guest guest_nice]`.
+/// `guest` and `guest_nice` are already accounted for in `user` and `nice` by the kernel and are
+/// intentionally excluded so they are not double-counted.
+pub fn parse_proc_stat(raw: &str) -> Option<CpuStatSample> {
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("cpu") {
+            continue;
+        }
+        let user: u64 = parts.next()?.parse().ok()?;
+        let nice: u64 = parts.next()?.parse().ok()?;
+        let system: u64 = parts.next()?.parse().ok()?;
+        let idle: u64 = parts.next()?.parse().ok()?;
+
+        let mut opt = || -> Option<u64> {
+            match parts.next() {
+                Some(s) => s.parse().ok(),
+                None => Some(0),
+            }
+        };
+        let iowait = opt()?;
+        let irq = opt()?;
+        let softirq = opt()?;
+        let steal = opt()?;
+
+        let idle_all = idle.saturating_add(iowait);
+        let non_idle = user
+            .saturating_add(nice)
+            .saturating_add(system)
+            .saturating_add(irq)
+            .saturating_add(softirq)
+            .saturating_add(steal);
+        let total = idle_all.saturating_add(non_idle);
+        return Some(CpuStatSample { total, idle_all });
+    }
+    None
+}
+
+/// Computes integer CPU utilization percentage (`0..=100`) between two `/proc/stat` samples.
+///
+/// Returns `None` when total jiffies did not advance (`curr.total <= prev.total`).
+pub fn calculate_cpu_usage_percent(prev: CpuStatSample, curr: CpuStatSample) -> Option<u32> {
+    if curr.total <= prev.total {
+        return None;
+    }
+    let total_delta = curr.total - prev.total;
+    let idle_delta = curr.idle_all.saturating_sub(prev.idle_all);
+    let active_delta = total_delta.saturating_sub(idle_delta);
+    let pct = ((active_delta as f64 / total_delta as f64) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u32;
+    Some(pct)
 }
 
 #[cfg(test)]
@@ -478,5 +541,94 @@ mod tests {
         assert_eq!(format_cpu_temp("0"), "0°C");
         assert_eq!(format_cpu_temp("-5000"), "-5°C");
         assert_eq!(format_cpu_temp("invalid"), "0°C");
+    }
+
+    // --- /proc/stat CPU Usage Tests ---
+
+    #[test]
+    fn test_parse_proc_stat_standard() {
+        let raw = "\
+cpu  82684 2534 39153 1764901 4374 8871 2710 0 100 50
+cpu0 42 0 99 118120 18 128 4 0 0 0
+cpu1 71 0 89 118089 151 12 2 0 0 0
+";
+        let sample = parse_proc_stat(raw).expect("valid /proc/stat");
+        // idle_all = 1764901 + 4374 = 1769275
+        // non_idle = 82684 + 2534 + 39153 + 8871 + 2710 + 0 = 135952
+        // guest (100) and guest_nice (50) must NOT be double-counted
+        assert_eq!(sample.idle_all, 1_769_275);
+        assert_eq!(sample.total, 1_769_275 + 135_952);
+    }
+
+    #[test]
+    fn test_parse_proc_stat_minimal_four_fields() {
+        let raw = "cpu  100 20 30 850\n";
+        let sample = parse_proc_stat(raw).expect("4-field /proc/stat");
+        assert_eq!(sample.idle_all, 850);
+        assert_eq!(sample.total, 1000);
+    }
+
+    #[test]
+    fn test_parse_proc_stat_invalid_or_missing() {
+        assert_eq!(parse_proc_stat(""), None);
+        assert_eq!(parse_proc_stat("cpu0 10 20 30 40\n"), None);
+        assert_eq!(parse_proc_stat("cpu  10 20 30\n"), None);
+        assert_eq!(parse_proc_stat("cpu  10 abc 30 40\n"), None);
+        assert_eq!(parse_proc_stat("cpu  10 20 30 40 oops\n"), None);
+    }
+
+    #[test]
+    fn test_calculate_cpu_usage_percent() {
+        let s1 = CpuStatSample {
+            total: 1000,
+            idle_all: 800,
+        };
+        let s2 = CpuStatSample {
+            total: 2000,
+            idle_all: 1550,
+        };
+        // total_delta = 1000, idle_delta = 750 -> active = 250 -> 25%
+        assert_eq!(calculate_cpu_usage_percent(s1, s2), Some(25));
+
+        let full_busy = CpuStatSample {
+            total: 1500,
+            idle_all: 800,
+        };
+        assert_eq!(calculate_cpu_usage_percent(s1, full_busy), Some(100));
+
+        let full_idle = CpuStatSample {
+            total: 1500,
+            idle_all: 1300,
+        };
+        assert_eq!(calculate_cpu_usage_percent(s1, full_idle), Some(0));
+
+        // Rounding: 2 / 3 -> 66.66% -> 67%
+        let round_up = CpuStatSample {
+            total: 1003,
+            idle_all: 801,
+        };
+        assert_eq!(calculate_cpu_usage_percent(s1, round_up), Some(67));
+    }
+
+    #[test]
+    fn test_calculate_cpu_usage_percent_edge_cases() {
+        let s1 = CpuStatSample {
+            total: 1000,
+            idle_all: 800,
+        };
+        // Zero delta or counter regression
+        assert_eq!(calculate_cpu_usage_percent(s1, s1), None);
+        let regressed = CpuStatSample {
+            total: 900,
+            idle_all: 700,
+        };
+        assert_eq!(calculate_cpu_usage_percent(s1, regressed), None);
+
+        // Kernel iowait quirk where idle_all slightly decreases while total increases
+        let iowait_quirk = CpuStatSample {
+            total: 1010,
+            idle_all: 799,
+        };
+        assert_eq!(calculate_cpu_usage_percent(s1, iowait_quirk), Some(100));
     }
 }

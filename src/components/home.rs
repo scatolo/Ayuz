@@ -90,6 +90,7 @@ pub struct HomeModel {
     active_profile_id: String,
     profiles_flow: gtk::FlowBox,
     profiles_section: gtk::Box,
+    polling_tx: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -109,6 +110,7 @@ pub enum HomeMsg {
     ConfirmIconChange { id: String, icon: String },
     DeleteProfile(String),
     RefreshProfiles,
+    SetPollingActive(bool),
 }
 
 #[derive(Debug)]
@@ -165,7 +167,19 @@ fn metric_card(icon_name: &str, title: &str) -> (gtk::Box, gtk::Label) {
     (card, value_label)
 }
 
-async fn fetch_metrics() -> HomeCommandOutput {
+async fn read_cpu_stat_sample() -> Option<CpuStatSample> {
+    let content = tokio::fs::read_to_string(SYS_PROC_STAT).await.ok()?;
+    parse_proc_stat(&content)
+}
+
+async fn fetch_metrics(
+    prev_cpu: Option<CpuStatSample>,
+) -> (HomeCommandOutput, Option<CpuStatSample>) {
+    let first_cpu = match prev_cpu {
+        Some(prev) => Some(prev),
+        None => read_cpu_stat_sample().await,
+    };
+
     let battery = {
         let paths = find_battery_capacity_paths();
         let mut capacities = Vec::new();
@@ -181,11 +195,18 @@ async fn fetch_metrics() -> HomeCommandOutput {
         aggregate_battery_percentage(&capacities)
     };
 
-    let cpu = {
-        let load = tokio::fs::read_to_string(SYS_LOAD_AVG)
-            .await
-            .map(|s| s.split_whitespace().next().unwrap_or("?").to_string())
-            .unwrap_or_else(|_| "?".to_string());
+    if prev_cpu.is_none() && first_cpu.is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let (cpu, next_cpu) = {
+        let curr_cpu = read_cpu_stat_sample().await;
+        let cpu_pct = first_cpu
+            .zip(curr_cpu)
+            .and_then(|(prev, curr)| calculate_cpu_usage_percent(prev, curr));
+        let pct_str = cpu_pct
+            .map(|p| format!("{p}%"))
+            .unwrap_or_else(|| "?%".to_string());
 
         let temp_path = find_cpu_temp_path();
         let temp = tokio::fs::read_to_string(&temp_path)
@@ -193,7 +214,7 @@ async fn fetch_metrics() -> HomeCommandOutput {
             .map(|s| format_cpu_temp(&s))
             .unwrap_or_else(|_| "?°C".to_string());
 
-        format!("{}% | {}", load, temp)
+        (format!("{pct_str} | {temp}"), curr_cpu.or(first_cpu))
     };
 
     let ram = tokio::fs::read_to_string(SYS_MEM_INFO)
@@ -242,12 +263,15 @@ async fn fetch_metrics() -> HomeCommandOutput {
         })
         .unwrap_or_else(|_| "N/A".to_string());
 
-    HomeCommandOutput::MetricsRefreshed {
-        battery,
-        cpu,
-        ram,
-        disk,
-    }
+    (
+        HomeCommandOutput::MetricsRefreshed {
+            battery,
+            cpu,
+            ram,
+            disk,
+        },
+        next_cpu,
+    )
 }
 
 fn build_profile_card(
@@ -417,7 +441,7 @@ fn build_add_profile_card(sender: &ComponentSender<HomeModel>) -> gtk::Widget {
 
 #[relm4::component(pub)]
 impl Component for HomeModel {
-    type Init = ();
+    type Init = bool;
     type Input = HomeMsg;
     type Output = HomeOutput;
     type CommandOutput = HomeCommandOutput;
@@ -463,7 +487,7 @@ impl Component for HomeModel {
     }
 
     fn init(
-        _init: Self::Init,
+        initially_visible: Self::Init,
         _root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
@@ -571,6 +595,8 @@ impl Component for HomeModel {
         profiles_section.append(&profiles_subtitle);
         profiles_section.append(&profiles_scroll);
 
+        let (polling_tx, mut polling_rx) = tokio::sync::watch::channel(initially_visible);
+
         let model = HomeModel {
             product_name_label,
             laptop_image,
@@ -588,6 +614,7 @@ impl Component for HomeModel {
             active_profile_id,
             profiles_flow,
             profiles_section,
+            polling_tx,
         };
 
         let widgets = view_output!();
@@ -637,13 +664,31 @@ impl Component for HomeModel {
                 .drop_on_shutdown()
         });
 
-        // Fetch metrics immediately, then every 5 seconds, cancelled on shutdown.
+        // Fetch metrics while the window is visible; pause when hidden in the tray to avoid wakeups.
         sender.command(move |out, shutdown| {
             shutdown
                 .register(async move {
+                    let mut prev_cpu: Option<CpuStatSample> = None;
                     loop {
-                        out.emit(fetch_metrics().await);
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        while !*polling_rx.borrow_and_update() {
+                            prev_cpu = None;
+                            if polling_rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+
+                        let (metrics, next_cpu) = fetch_metrics(prev_cpu).await;
+                        prev_cpu = next_cpu;
+                        out.emit(metrics);
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            res = polling_rx.changed() => {
+                                if res.is_err() {
+                                    return;
+                                }
+                            }
+                        }
                     }
                 })
                 .drop_on_shutdown()
@@ -678,6 +723,17 @@ impl Component for HomeModel {
                 self.profiles = config.profiles.clone();
                 self.active_profile_id = config.active_profile_id.clone();
                 self.rebuild_profile_cards(&sender);
+            }
+
+            HomeMsg::SetPollingActive(active) => {
+                let _ = self.polling_tx.send_if_modified(|cur| {
+                    if *cur == active {
+                        false
+                    } else {
+                        *cur = active;
+                        true
+                    }
+                });
             }
 
             HomeMsg::CreateProfile => {

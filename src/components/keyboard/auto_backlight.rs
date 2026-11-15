@@ -22,22 +22,8 @@ use relm4::prelude::*;
 use rust_i18n::t;
 use tokio::sync::watch;
 
-use crate::services::commands::run_command_blocking;
+use super::kbd_dbus::{AmbientRules, KbdBacklightProxy, SensorProxyProxy};
 use crate::services::config::AppConfig;
-
-#[zbus::proxy(
-    interface = "net.hadess.SensorProxy",
-    default_service = "net.hadess.SensorProxy",
-    default_path = "/net/hadess/SensorProxy"
-)]
-trait SensorProxy {
-    fn claim_light(&self) -> zbus::Result<()>;
-    fn release_light(&self) -> zbus::Result<()>;
-    #[zbus(property)]
-    fn light_level(&self) -> zbus::Result<f64>;
-    #[zbus(property)]
-    fn has_ambient_light(&self) -> zbus::Result<bool>;
-}
 
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Manager",
@@ -248,12 +234,18 @@ impl Component for AutoBacklightModel {
     fn update(&mut self, msg: AutoBacklightMsg, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             AutoBacklightMsg::ToggleAutoBrighten(active) => {
+                if active == self.auto_brighten {
+                    return;
+                }
                 self.auto_brighten = active;
                 AppConfig::update(|c| c.active_profile_mut().kbd_brighten_active = active);
                 self.update_sensor_loop(sender.clone());
                 let _ = sender.output(AutoBacklightOutput::AmbientChanged);
             }
             AutoBacklightMsg::ToggleAutoDim(active) => {
+                if active == self.auto_dim {
+                    return;
+                }
                 self.auto_dim = active;
                 AppConfig::update(|c| c.active_profile_mut().kbd_dim_active = active);
                 self.update_sensor_loop(sender.clone());
@@ -394,45 +386,42 @@ async fn session_locked(session: Option<&LogindSessionProxy<'_>>) -> bool {
     }
 }
 
-/// Sets the keyboard backlight brightness level (0–3) via the UPower D-Bus interface.
-///
-/// Returns `true` on success; failures are treated as non-fatal by callers.
-async fn set_kbd_brightness(value: i32) -> bool {
-    run_command_blocking(
-        "busctl",
-        &[
-            "call",
-            "--system",
-            "org.freedesktop.UPower",
-            "/org/freedesktop/UPower/KbdBacklight",
-            "org.freedesktop.UPower.KbdBacklight",
-            "SetBrightness",
-            "i",
-            &value.to_string(),
-        ],
-    )
-    .await
-    .is_ok()
+/// Decides the target keyboard backlight brightness for a given ambient `level`,
+/// returning `Some(target)` only when the level differs from `current_brightness`.
+pub(super) fn decide_ambient_brightness(
+    level: f64,
+    rules: AmbientRules,
+    current_brightness: i32,
+    max_brightness: i32,
+) -> Option<i32> {
+    let max_b = max_brightness.max(1);
+    if rules.auto_brighten && level < rules.brighten_threshold && current_brightness != max_b {
+        Some(max_b)
+    } else if rules.auto_dim && level > rules.dim_threshold && current_brightness != 0 {
+        Some(0)
+    } else {
+        None
+    }
 }
 
-/// Applies auto-brighten/dim rules for a given lux reading and returns the new brightness level.
+/// Applies auto-brighten/dim rules for a given lux reading via `UPower.KbdBacklight`
+/// and returns the resulting brightness level.
 ///
-/// Only adjusts brightness if it would actually change, preventing redundant D-Bus calls.
+/// Only sends a D-Bus call if brightness would actually change.
 async fn light_sensor_logic(
     level: f64,
-    auto_brighten: bool,
-    brighten_threshold: f64,
-    auto_dim: bool,
-    dim_threshold: f64,
+    rules: AmbientRules,
     mut current_brightness: i32,
+    max_brightness: i32,
+    kbd_proxy: Option<&KbdBacklightProxy<'_>>,
 ) -> i32 {
-    if auto_brighten && level < brighten_threshold && current_brightness != 3 {
-        if set_kbd_brightness(3).await {
-            current_brightness = 3;
-        }
-    } else if auto_dim && level > dim_threshold && current_brightness != 0 {
-        if set_kbd_brightness(0).await {
-            current_brightness = 0;
+    if let Some(target) =
+        decide_ambient_brightness(level, rules, current_brightness, max_brightness)
+        && let Some(kbd) = kbd_proxy
+    {
+        match kbd.set_brightness(target).await {
+            Ok(()) => current_brightness = target,
+            Err(e) => tracing::warn!("UPower SetBrightness({target}) failed: {e}"),
         }
     }
     current_brightness
@@ -453,6 +442,12 @@ fn start_sensor_loop(
 ) -> watch::Sender<bool> {
     let (tx, mut rx) = watch::channel(true);
     let out = sender.command_sender().clone();
+    let rules = AmbientRules {
+        auto_brighten,
+        brighten_threshold,
+        auto_dim,
+        dim_threshold,
+    };
 
     tokio::spawn(async move {
         let conn = match zbus::Connection::system().await {
@@ -482,6 +477,23 @@ fn start_sensor_loop(
             return;
         }
 
+        let kbd_proxy = match KbdBacklightProxy::new(&conn).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("UPower KbdBacklight proxy unavailable: {e}");
+                None
+            }
+        };
+        let max_brightness = match kbd_proxy.as_ref() {
+            Some(p) => p
+                .get_max_brightness()
+                .await
+                .ok()
+                .filter(|&v| v > 0)
+                .unwrap_or(3),
+            None => 3,
+        };
+
         // Used to skip ambient-driven brightness changes while the session is locked, so a
         // change in ambient light does not switch the keyboard backlight on behind the lock screen.
         let session = resolve_session_proxy(&conn).await;
@@ -503,11 +515,10 @@ fn start_sensor_loop(
                 if !session_locked(session.as_ref()).await {
                     current_brightness = light_sensor_logic(
                         level,
-                        auto_brighten,
-                        brighten_threshold,
-                        auto_dim,
-                        dim_threshold,
+                        rules,
                         current_brightness,
+                        max_brightness,
+                        kbd_proxy.as_ref(),
                     )
                     .await;
                 }
@@ -541,11 +552,10 @@ fn start_sensor_loop(
                         if matches!(change.get().await, Ok(false)) && last_level >= 0.0 {
                             current_brightness = light_sensor_logic(
                                 last_level,
-                                auto_brighten,
-                                brighten_threshold,
-                                auto_dim,
-                                dim_threshold,
+                                rules,
                                 -1,
+                                max_brightness,
+                                kbd_proxy.as_ref(),
                             )
                             .await;
                         }
@@ -562,11 +572,10 @@ fn start_sensor_loop(
                                 if !session_locked(session.as_ref()).await {
                                     current_brightness = light_sensor_logic(
                                         level,
-                                        auto_brighten,
-                                        brighten_threshold,
-                                        auto_dim,
-                                        dim_threshold,
+                                        rules,
                                         current_brightness,
+                                        max_brightness,
+                                        kbd_proxy.as_ref(),
                                     )
                                     .await;
                                 }
@@ -588,4 +597,50 @@ fn start_sensor_loop(
     });
 
     tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_rules() -> AmbientRules {
+        AmbientRules {
+            auto_brighten: true,
+            brighten_threshold: 12.0,
+            auto_dim: true,
+            dim_threshold: 35.0,
+        }
+    }
+
+    #[test]
+    fn test_decide_ambient_brightness_dynamic_max() {
+        let rules = test_rules();
+        assert_eq!(decide_ambient_brightness(5.0, rules, -1, 255), Some(255));
+        assert_eq!(decide_ambient_brightness(5.0, rules, 255, 255), None);
+        assert_eq!(decide_ambient_brightness(5.0, rules, -1, 1), Some(1));
+
+        // Non-positive max brightness clamps safely to 1
+        let brighten_only = AmbientRules {
+            auto_dim: false,
+            ..rules
+        };
+        assert_eq!(
+            decide_ambient_brightness(5.0, brighten_only, 0, 0),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_decide_ambient_brightness_deadband_and_dim() {
+        let rules = test_rules();
+        // Inside deadband [12.0, 35.0] -> no change
+        assert_eq!(decide_ambient_brightness(20.0, rules, 3, 3), None);
+        assert_eq!(decide_ambient_brightness(12.0, rules, 0, 3), None);
+        assert_eq!(decide_ambient_brightness(35.0, rules, 3, 3), None);
+
+        // Above dim threshold -> turn off
+        assert_eq!(decide_ambient_brightness(40.0, rules, 3, 3), Some(0));
+        // Already off -> no redundant call
+        assert_eq!(decide_ambient_brightness(40.0, rules, 0, 3), None);
+    }
 }

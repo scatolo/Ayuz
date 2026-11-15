@@ -138,6 +138,7 @@ sleep_timeout_2min: "2 minutos"
 sleep_timeout_5min: "5 minutos"
 error_swayidle_start: "Falha ao iniciar o swayidle: %{error}"
 error_swayidle_wait: "Falha ao aguardar o swayidle: %{error}"
+error_idle_monitor: "Falha no monitor de inatividade: %{error}"
 
 # fn_key
 fn_key_group_title: "Tecla Fn"

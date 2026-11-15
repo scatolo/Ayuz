@@ -138,6 +138,7 @@ sleep_timeout_2min: "2 minute(s)"
 sleep_timeout_5min: "5 minute(s)"
 error_swayidle_start: "Failed to start swayidle: %{error}"
 error_swayidle_wait: "Failed to wait for swayidle: %{error}"
+error_idle_monitor: "Idle monitor failed: %{error}"
 
 # fn_key
 fn_key_group_title: "Function Key"

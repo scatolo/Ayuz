@@ -14,13 +14,38 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use futures_util::StreamExt;
 use gtk4 as gtk;
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::prelude::*;
 use rust_i18n::t;
+use tokio::sync::watch;
 
+use super::kbd_dbus::{
+    AmbientRules, KbdBacklightProxy, get_kbd_max_brightness, is_on_battery, read_ambient_lux,
+};
+use crate::services::commands::is_gnome_desktop;
 use crate::services::config::AppConfig;
+
+#[zbus::proxy(
+    interface = "org.gnome.Mutter.IdleMonitor",
+    default_service = "org.gnome.Mutter.IdleMonitor",
+    default_path = "/org/gnome/Mutter/IdleMonitor/Core"
+)]
+trait MutterIdleMonitor {
+    #[zbus(name = "AddIdleWatch")]
+    fn add_idle_watch(&self, interval: u64) -> zbus::Result<u32>;
+
+    #[zbus(name = "AddUserActiveWatch")]
+    fn add_user_active_watch(&self) -> zbus::Result<u32>;
+
+    #[zbus(name = "RemoveWatch")]
+    fn remove_watch(&self, id: u32) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "WatchFired")]
+    fn watch_fired(&self, id: u32) -> zbus::Result<()>;
+}
 
 /// Controls when the keyboard backlight idle-timeout is active.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -76,32 +101,29 @@ fn busctl_brightness_cmd(value: i32, battery_only: bool) -> String {
 }
 
 /// Builds the `busctl` resume command `swayidle` runs when the user returns from idle.
-fn busctl_resume_cmd(
-    battery_only: bool,
-    auto_brighten: bool,
-    brighten_threshold: f64,
-    auto_dim: bool,
-    dim_threshold: f64,
-) -> String {
-    if !auto_brighten && !auto_dim {
-        return busctl_brightness_cmd(3, battery_only);
+fn busctl_resume_cmd(battery_only: bool, rules: AmbientRules, max_brightness: i32) -> String {
+    let max_b = max_brightness.max(1);
+    if !rules.auto_brighten && !rules.auto_dim {
+        return busctl_brightness_cmd(max_b, battery_only);
     }
 
     // Read the live ambient level held by the ambient loop's sensor claim. `$lvl` is empty when
-    // the sensor is unavailable, in which case the rules below leave `v` at its default of 3.
+    // the sensor is unavailable, in which case the rules below leave `v` at `max_b`.
     let read_lux = "lvl=$(busctl --system get-property net.hadess.SensorProxy \
         /net/hadess/SensorProxy net.hadess.SensorProxy LightLevel 2>/dev/null | awk '{print $2}')";
 
     // Default to full brightness
-    let mut decide = String::from("v=3");
-    if auto_dim {
+    let mut decide = format!("v={max_b}");
+    if rules.auto_dim {
         decide.push_str(&format!(
-            "; if [ -n \"$lvl\" ] && awk \"BEGIN{{exit !($lvl > {dim_threshold})}}\"; then v=0; fi"
+            "; if [ -n \"$lvl\" ] && awk \"BEGIN{{exit !($lvl > {})}}\"; then v=0; fi",
+            rules.dim_threshold
         ));
     }
-    if auto_brighten {
+    if rules.auto_brighten {
         decide.push_str(&format!(
-            "; if [ -n \"$lvl\" ] && awk \"BEGIN{{exit !($lvl >= {brighten_threshold})}}\"; then v=0; fi"
+            "; if [ -n \"$lvl\" ] && awk \"BEGIN{{exit !($lvl >= {})}}\"; then v=0; fi",
+            rules.brighten_threshold
         ));
     }
 
@@ -112,14 +134,51 @@ fn busctl_resume_cmd(
     battery_guard(&format!("{read_lux}; {decide}; {set}"), battery_only)
 }
 
+/// Computes the target keyboard backlight brightness when returning from idle on GNOME.
+pub(super) fn decide_resume_brightness(
+    saved_brightness: i32,
+    max_brightness: i32,
+    rules: AmbientRules,
+    ambient_lux: Option<f64>,
+) -> i32 {
+    let max_b = max_brightness.max(1);
+    let restored = if saved_brightness > 0 {
+        saved_brightness.min(max_b)
+    } else {
+        max_b
+    };
+
+    if !rules.auto_brighten && !rules.auto_dim {
+        return restored;
+    }
+
+    let Some(lvl) = ambient_lux else {
+        return restored;
+    };
+
+    if rules.auto_dim && lvl > rules.dim_threshold {
+        return 0;
+    }
+    if rules.auto_brighten {
+        if lvl >= rules.brighten_threshold {
+            return 0;
+        }
+        return max_b;
+    }
+
+    restored
+}
+
 pub struct BacklightIdleModel {
     timeout_mode: TimeoutMode,
+    battery_ac_index: u32,
+    battery_only_index: u32,
     check_never: gtk::CheckButton,
     check_battery_and_ac: gtk::CheckButton,
     check_battery_only: gtk::CheckButton,
     dropdown_battery_and_ac: gtk::DropDown,
     dropdown_battery_only: gtk::DropDown,
-    swayidle_task: Option<tokio::task::JoinHandle<()>>,
+    idle_stop_tx: Option<watch::Sender<bool>>,
 }
 
 #[derive(Debug)]
@@ -244,12 +303,14 @@ impl Component for BacklightIdleModel {
 
         let mut model = BacklightIdleModel {
             timeout_mode: mode,
+            battery_ac_index: p.kbd_timeout_battery_ac_index,
+            battery_only_index: p.kbd_timeout_battery_only_index,
             check_never,
             check_battery_and_ac,
             check_battery_only,
             dropdown_battery_and_ac,
             dropdown_battery_only,
-            swayidle_task: None,
+            idle_stop_tx: None,
         };
 
         let widgets = view_output!();
@@ -260,17 +321,28 @@ impl Component for BacklightIdleModel {
     fn update(&mut self, msg: BacklightIdleMsg, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             BacklightIdleMsg::ChangeMode(mode) => {
+                if mode == self.timeout_mode {
+                    return;
+                }
                 self.timeout_mode = mode;
                 AppConfig::update(|c| c.active_profile_mut().kbd_timeout_mode = mode as u32);
                 self.apply_timeout(mode, &sender);
             }
             BacklightIdleMsg::BatteryAndAcTimeChanged(index) => {
+                if index == self.battery_ac_index {
+                    return;
+                }
+                self.battery_ac_index = index;
                 AppConfig::update(|c| c.active_profile_mut().kbd_timeout_battery_ac_index = index);
                 if self.timeout_mode == TimeoutMode::BatteryAndAc {
                     self.apply_timeout(TimeoutMode::BatteryAndAc, &sender);
                 }
             }
             BacklightIdleMsg::BatteryOnlyTimeChanged(index) => {
+                if index == self.battery_only_index {
+                    return;
+                }
+                self.battery_only_index = index;
                 AppConfig::update(|c| {
                     c.active_profile_mut().kbd_timeout_battery_only_index = index
                 });
@@ -285,6 +357,8 @@ impl Component for BacklightIdleModel {
             } => {
                 let timeout_mode = TimeoutMode::from(mode);
                 self.timeout_mode = timeout_mode;
+                self.battery_ac_index = ac_index;
+                self.battery_only_index = battery_index;
                 self.check_never
                     .set_active(timeout_mode == TimeoutMode::Never);
                 self.check_battery_and_ac
@@ -317,13 +391,17 @@ impl Component for BacklightIdleModel {
 }
 
 impl BacklightIdleModel {
-    /// (Re)starts the `swayidle` daemon with the current timeout settings.
+    /// (Re)starts the idle-timeout monitor with the current timeout settings.
     ///
-    /// Aborts any previously running `swayidle` task before spawning a new one.
-    /// Does nothing (and kills the old task) when `mode` is [`TimeoutMode::Never`].
+    /// Stops any previously running idle-monitor task before starting a new one.
+    /// Does nothing (and stops the old task) when `mode` is [`TimeoutMode::Never`].
+    ///
+    /// Uses `org.gnome.Mutter.IdleMonitor` + `org.freedesktop.UPower.KbdBacklight` via `zbus`
+    /// on GNOME Wayland (where `swayidle` fails because Mutter lacks `ext-idle-notify-v1`),
+    /// and retains `swayidle` on KDE/COSMIC/wlroots compositors.
     fn apply_timeout(&mut self, mode: TimeoutMode, sender: &ComponentSender<BacklightIdleModel>) {
-        if let Some(task) = self.swayidle_task.take() {
-            task.abort();
+        if let Some(tx) = self.idle_stop_tx.take() {
+            let _ = tx.send(false);
         }
 
         if mode == TimeoutMode::Never {
@@ -345,50 +423,317 @@ impl BacklightIdleModel {
         };
 
         let battery_only = mode == TimeoutMode::BatteryOnly;
-        let timeout_cmd = busctl_brightness_cmd(0, battery_only);
 
         // Make the resume restore ambient-aware so returning from idle in a lit room does not
         // force the backlight to full brightness (issue #39).
         let config = AppConfig::load();
         let p = config.active_profile();
-        let resume_cmd = busctl_resume_cmd(
-            battery_only,
-            p.kbd_brighten_active,
-            p.kbd_brighten_threshold,
-            p.kbd_dim_active,
-            p.kbd_dim_threshold,
-        );
-        let seconds_str = seconds.to_string();
+        let rules = AmbientRules {
+            auto_brighten: p.kbd_brighten_active,
+            brighten_threshold: p.kbd_brighten_threshold,
+            auto_dim: p.kbd_dim_active,
+            dim_threshold: p.kbd_dim_threshold,
+        };
 
+        let (stop_tx, stop_rx) = watch::channel(true);
         let cmd_sender = sender.command_sender().clone();
-        let handle = tokio::spawn(async move {
-            let mut child = match tokio::process::Command::new("swayidle")
-                .kill_on_drop(true)
-                .args([
-                    "-w",
-                    "timeout",
-                    &seconds_str,
-                    &timeout_cmd,
-                    "resume",
-                    &resume_cmd,
-                ])
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    cmd_sender.emit(BacklightIdleCommandOutput::Error(
-                        t!("error_swayidle_start", error = e.to_string()).to_string(),
-                    ));
-                    return;
+
+        if is_gnome_desktop() {
+            tokio::spawn(run_gnome_idle_monitor(
+                seconds,
+                battery_only,
+                rules,
+                stop_rx,
+                cmd_sender,
+            ));
+        } else {
+            tokio::spawn(run_swayidle(
+                seconds,
+                battery_only,
+                rules,
+                stop_rx,
+                cmd_sender,
+            ));
+        }
+
+        self.idle_stop_tx = Some(stop_tx);
+    }
+}
+
+async fn run_gnome_idle_monitor(
+    seconds: u32,
+    battery_only: bool,
+    rules: AmbientRules,
+    mut stop_rx: watch::Receiver<bool>,
+    cmd_sender: relm4::Sender<BacklightIdleCommandOutput>,
+) {
+    let session_conn = match zbus::Connection::session().await {
+        Ok(c) => c,
+        Err(e) => {
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_idle_monitor", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    let idle_proxy = match MutterIdleMonitorProxy::new(&session_conn).await {
+        Ok(p) => p,
+        Err(e) => {
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_idle_monitor", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    let watch_fired = match idle_proxy.receive_watch_fired().await {
+        Ok(s) => s,
+        Err(e) => {
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_idle_monitor", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    let interval_ms = u64::from(seconds) * 1000;
+    let idle_watch_id = match idle_proxy.add_idle_watch(interval_ms).await {
+        Ok(id) => id,
+        Err(e) => {
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_idle_monitor", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    if !*stop_rx.borrow_and_update() {
+        let _ = idle_proxy.remove_watch(idle_watch_id).await;
+        return;
+    }
+
+    let sys_conn = match zbus::Connection::system().await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = idle_proxy.remove_watch(idle_watch_id).await;
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_idle_monitor", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    let kbd_proxy = match KbdBacklightProxy::new(&sys_conn).await {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = idle_proxy.remove_watch(idle_watch_id).await;
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_idle_monitor", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    let max_brightness = kbd_proxy
+        .get_max_brightness()
+        .await
+        .ok()
+        .filter(|&v| v > 0)
+        .unwrap_or(3);
+
+    let mut active_watch_id: Option<u32> = None;
+    let mut dimmed_from: Option<i32> = None;
+
+    tokio::pin!(watch_fired);
+
+    loop {
+        tokio::select! {
+            res = stop_rx.changed() => {
+                if res.is_err() || !*stop_rx.borrow() {
+                    break;
                 }
-            };
-            if let Err(e) = child.wait().await {
+            }
+            maybe_sig = watch_fired.next() => {
+                let Some(sig) = maybe_sig else {
+                    break;
+                };
+                let Ok(args) = sig.args() else {
+                    continue;
+                };
+                let fired_id = args.id;
+
+                if fired_id == idle_watch_id {
+                    if battery_only && !is_on_battery(&sys_conn).await {
+                        continue;
+                    }
+                    if dimmed_from.is_some() {
+                        continue;
+                    }
+                    let cur = kbd_proxy.get_brightness().await.unwrap_or(max_brightness);
+                    if cur <= 0 {
+                        continue;
+                    }
+                    if active_watch_id.is_none() {
+                        match idle_proxy.add_user_active_watch().await {
+                            Ok(id) => active_watch_id = Some(id),
+                            Err(e) => {
+                                tracing::warn!("Mutter AddUserActiveWatch failed: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    if kbd_proxy.set_brightness(0).await.is_ok() {
+                        dimmed_from = Some(cur);
+                    } else if let Some(aid) = active_watch_id.take() {
+                        let _ = idle_proxy.remove_watch(aid).await;
+                    }
+                } else if active_watch_id == Some(fired_id) {
+                    active_watch_id = None;
+                    if let Some(prev) = dimmed_from.take() {
+                        let ambient_lux = if rules.auto_brighten || rules.auto_dim {
+                            read_ambient_lux(&sys_conn).await
+                        } else {
+                            None
+                        };
+                        let target = decide_resume_brightness(
+                            prev,
+                            max_brightness,
+                            rules,
+                            ambient_lux,
+                        );
+                        if let Err(e) = kbd_proxy.set_brightness(target).await {
+                            tracing::warn!("Failed to restore keyboard backlight: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = idle_proxy.remove_watch(idle_watch_id).await;
+    if let Some(aid) = active_watch_id {
+        let _ = idle_proxy.remove_watch(aid).await;
+    }
+}
+
+async fn run_swayidle(
+    seconds: u32,
+    battery_only: bool,
+    rules: AmbientRules,
+    mut stop_rx: watch::Receiver<bool>,
+    cmd_sender: relm4::Sender<BacklightIdleCommandOutput>,
+) {
+    let max_brightness = get_kbd_max_brightness().await;
+    if !*stop_rx.borrow_and_update() {
+        return;
+    }
+
+    let timeout_cmd = busctl_brightness_cmd(0, battery_only);
+    let resume_cmd = busctl_resume_cmd(battery_only, rules, max_brightness);
+    let seconds_str = seconds.to_string();
+
+    let mut child = match tokio::process::Command::new("swayidle")
+        .kill_on_drop(true)
+        .args([
+            "-w",
+            "timeout",
+            &seconds_str,
+            &timeout_cmd,
+            "resume",
+            &resume_cmd,
+        ])
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            cmd_sender.emit(BacklightIdleCommandOutput::Error(
+                t!("error_swayidle_start", error = e.to_string()).to_string(),
+            ));
+            return;
+        }
+    };
+
+    tokio::select! {
+        res = child.wait() => {
+            if let Err(e) = res {
                 cmd_sender.emit(BacklightIdleCommandOutput::Error(
                     t!("error_swayidle_wait", error = e.to_string()).to_string(),
                 ));
             }
-        });
+        }
+        _ = stop_rx.changed() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+}
 
-        self.swayidle_task = Some(handle);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disabled_rules() -> AmbientRules {
+        AmbientRules {
+            auto_brighten: false,
+            brighten_threshold: 12.0,
+            auto_dim: false,
+            dim_threshold: 35.0,
+        }
+    }
+
+    #[test]
+    fn test_decide_resume_brightness_restores_saved_level() {
+        let rules = disabled_rules();
+        assert_eq!(decide_resume_brightness(2, 3, rules, None), 2);
+        assert_eq!(decide_resume_brightness(3, 3, rules, None), 3);
+        assert_eq!(decide_resume_brightness(0, 3, rules, None), 3);
+        assert_eq!(decide_resume_brightness(5, 3, rules, None), 3);
+        assert_eq!(decide_resume_brightness(128, 255, rules, None), 128);
+    }
+
+    #[test]
+    fn test_decide_resume_brightness_ambient_aware() {
+        let rules = AmbientRules {
+            auto_brighten: true,
+            brighten_threshold: 12.0,
+            auto_dim: true,
+            dim_threshold: 35.0,
+        };
+        // Dark room -> restore to max
+        assert_eq!(decide_resume_brightness(2, 3, rules, Some(5.0)), 3);
+        assert_eq!(decide_resume_brightness(2, 255, rules, Some(5.0)), 255);
+        // Bright room -> stay off
+        assert_eq!(decide_resume_brightness(2, 3, rules, Some(50.0)), 0);
+        // Above brighten threshold -> stay off when auto_brighten is active
+        assert_eq!(decide_resume_brightness(2, 3, rules, Some(15.0)), 0);
+        // Sensor unavailable -> restore saved level (or max if unknown/zero)
+        assert_eq!(decide_resume_brightness(2, 3, rules, None), 2);
+        assert_eq!(decide_resume_brightness(0, 3, rules, None), 3);
+
+        // Auto-dim only -> keep saved level when room is not bright
+        let dim_only = AmbientRules {
+            auto_brighten: false,
+            ..rules
+        };
+        assert_eq!(decide_resume_brightness(1, 3, dim_only, Some(10.0)), 1);
+        assert_eq!(decide_resume_brightness(1, 3, dim_only, Some(50.0)), 0);
+        assert_eq!(decide_resume_brightness(1, 3, dim_only, None), 1);
+    }
+
+    #[test]
+    fn test_busctl_resume_cmd_uses_dynamic_max() {
+        let cmd = busctl_resume_cmd(false, disabled_rules(), 255);
+        assert!(cmd.contains("SetBrightness i 255"));
+
+        let rules = AmbientRules {
+            auto_brighten: true,
+            brighten_threshold: 12.0,
+            auto_dim: false,
+            dim_threshold: 35.0,
+        };
+        let ambient_cmd = busctl_resume_cmd(true, rules, 2);
+        assert!(ambient_cmd.contains("v=2"));
+        assert!(ambient_cmd.contains("/sys/class/power_supply/*/online"));
     }
 }

@@ -17,6 +17,7 @@
 pub mod auto_backlight;
 pub mod backlight_idle;
 pub mod fn_key;
+mod kbd_dbus;
 
 pub use auto_backlight::AutoBacklightModel;
 pub use backlight_idle::BacklightIdleModel;

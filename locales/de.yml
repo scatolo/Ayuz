@@ -138,6 +138,7 @@ sleep_timeout_2min: "2 Minute(n)"
 sleep_timeout_5min: "5 Minute(n)"
 error_swayidle_start: "swayidle starten fehlgeschlagen: %{error}"
 error_swayidle_wait: "swayidle warten fehlgeschlagen: %{error}"
+error_idle_monitor: "Inaktivitätsüberwachung fehlgeschlagen: %{error}"
 
 # fn_key
 fn_key_group_title: "Funktionstaste"
