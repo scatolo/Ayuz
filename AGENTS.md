@@ -6,7 +6,7 @@ Repository guidance for coding agents and contributors working on **Ayuz** (`sca
 
 ## 1. Fork Identity & Target Scope
 
-- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.12` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
+- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.13` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
 - **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 · GNOME (Wayland)**.
 - **Upstream Target Retained**: **ASUS Zenbook S16** running **Fedora 43 · KDE Plasma (Wayland)** (and COSMIC where supported).
 - **Explicit Scope Boundaries**:
@@ -110,10 +110,10 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
 | `src/services/config.rs` | `AppConfig` & `Profile` JSON persistence at `~/.config/ayuz/config.json` (`ProjectDirs::from("", "", "ayuz")`). |
 | `src/services/migration.rs` | Legacy `~/.config/asus-hub/config.json` detection and migration prompts. |
 | `src/services/commands.rs` | `run_command_blocking`, `&'static str`-guarded `pkexec_read_file` / `pkexec_write_sysfs`, `which_exists`, `resolve_qdbus_path`, `is_kde_desktop` / `is_gnome_desktop` / `is_cosmic_desktop`. |
-| `src/services/dbus.rs` | `zbus` system-bus proxies for `xyz.ljones.Asusd` (`Platform`, `FanProfile`, charge limit, `AsusArmoury` `apu_mem`, `Aura` discovery/control) and `org.supergfxctl.Daemon` (`GfxMode`). |
+| `src/services/dbus.rs` | `zbus` system-bus proxies for `xyz.ljones.Asusd` (`Platform`, `FanProfile`, charge limit, `AsusArmoury` `apu_mem`, `Aura` discovery/control), `org.freedesktop.UPower.PowerProfiles` (`ActiveProfile` sync), and `org.supergfxctl.Daemon` (`GfxMode`). |
 | `src/services/dbus_animatrix.rs` | DMI AniMatrix board detection (`detect_animatrix_hardware`) and `zbus` proxy (`xyz.ljones.Anime`) for AniMatrix controls and GIF frame streaming. |
 | `src/services/evdev_runner.rs` | Shared `/dev/input/` helpers (`find_touchpad` skipping `ayuz*` virtual devices, `find_keyboards`, `touchpad_abs_ranges`, `touchpad_abs_bounds`, `open_event_stream`). |
-| `src/services/edge_gestures.rs` | Touchpad edge-swipe loop: left edge = volume (`wpctl` preferred, `pactl` fallback), right edge = brightness (KDE D-Bus / GNOME `uinput` + D-Bus / `brightnessctl`), top edge = media (`playerctl`). |
+| `src/services/edge_gestures.rs` | Touchpad edge-swipe loop: left edge = volume (GNOME `uinput` + `wpctl`/`pactl` fallback), right edge = brightness (KDE D-Bus / GNOME `uinput` + D-Bus / `brightnessctl`), top edge = media (`playerctl`). |
 | `src/services/gnome_brightness.rs` | GNOME brightness control via `/dev/uinput` (`KEY_BRIGHTNESSUP`/`KEY_BRIGHTNESSDOWN`) with session D-Bus fallback (`org.gnome.SettingsDaemon.Power.Screen` and `org.gnome.Mutter.DisplayConfig`). |
 | `src/services/kde_brightness.rs` | KDE PowerDevil D-Bus brightness control (`org.kde.Solid.PowerManagement.Actions.BrightnessControl`). |
 | `src/services/touchpad_ctl.rs` | DE-agnostic touchpad enable/disable (`gsettings` on GNOME, `qdbus` on KDE). |

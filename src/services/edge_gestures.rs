@@ -14,9 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
-use evdev::{AbsoluteAxisCode, EventSummary, KeyCode};
+use evdev::uinput::VirtualDevice;
+use evdev::{AbsoluteAxisCode, AttributeSet, EventSummary, EventType, InputEvent, KeyCode};
 use rust_i18n::t;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::services::commands::{is_gnome_desktop, is_kde_desktop};
@@ -30,6 +32,9 @@ use crate::services::kde_brightness;
 const EDGE_PERCENT: f64 = 0.08;
 /// Minimum movement in touchpad units required to trigger an action
 const STEP_THRESHOLD: i32 = 300;
+/// Delay after creating a virtual uinput device so udev/libinput/Mutter have
+/// opened the new `/dev/input/event*` node before the first key event arrives.
+const UINPUT_SETTLE_DELAY: Duration = Duration::from_millis(200);
 
 /// Computes `(left_bound, right_bound, top_bound)` from the touchpad's axis
 /// minimum/maximum bounds, ensuring non-zero or negative minimums are respected.
@@ -141,7 +146,83 @@ pub(crate) fn volume_commands(has_wpctl: bool, increase: bool) -> [(&'static str
     }
 }
 
-async fn adjust_volume(increase: bool) {
+/// Maps a volume direction (`increase == true` for up, `false` for down) to
+/// the corresponding hardware keycode.
+pub(crate) fn volume_key_for_direction(increase: bool) -> KeyCode {
+    if increase {
+        KeyCode::KEY_VOLUMEUP
+    } else {
+        KeyCode::KEY_VOLUMEDOWN
+    }
+}
+
+/// Persistent `/dev/uinput` virtual device exposing `KEY_VOLUMEDOWN` and
+/// `KEY_VOLUMEUP`.
+///
+/// Injecting standard volume key events lets GNOME Shell handle the native
+/// volume OSD and PipeWire sink updates together.
+struct VirtualVolumeDevice {
+    device: VirtualDevice,
+    created_at: Instant,
+}
+
+impl VirtualVolumeDevice {
+    fn new() -> std::io::Result<Self> {
+        let keys: AttributeSet<KeyCode> =
+            AttributeSet::from_iter([KeyCode::KEY_VOLUMEDOWN, KeyCode::KEY_VOLUMEUP]);
+        let device = VirtualDevice::builder()?
+            .name("Ayuz Volume Control")
+            .with_keys(&keys)?
+            .build()?;
+        Ok(Self {
+            device,
+            created_at: Instant::now(),
+        })
+    }
+
+    async fn step(&mut self, increase: bool) -> Result<(), String> {
+        let key = volume_key_for_direction(increase);
+
+        let remaining = UINPUT_SETTLE_DELAY.saturating_sub(self.created_at.elapsed());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+
+        let press = InputEvent::new(EventType::KEY.0, key.0, 1);
+        self.device
+            .emit(&[press])
+            .map_err(|e| format!("uinput emit press failed: {e}"))?;
+        let release = InputEvent::new(EventType::KEY.0, key.0, 0);
+        self.device
+            .emit(&[release])
+            .map_err(|e| format!("uinput emit release failed: {e}"))?;
+        Ok(())
+    }
+}
+
+fn create_volume_uinput_device() -> Option<VirtualVolumeDevice> {
+    match VirtualVolumeDevice::new() {
+        Ok(dev) => Some(dev),
+        Err(e) => {
+            tracing::warn!(
+                "GNOME volume uinput unavailable ({e}); falling back to wpctl/pactl"
+            );
+            None
+        }
+    }
+}
+
+async fn adjust_volume(increase: bool, uinput: Option<&mut VirtualVolumeDevice>) {
+    if let Some(dev) = uinput {
+        match dev.step(increase).await {
+            Ok(()) => return,
+            Err(e) => {
+                tracing::warn!(
+                    "GNOME volume uinput emit failed ({e}); falling back to wpctl/pactl"
+                );
+            }
+        }
+    }
     for (prog, args) in volume_commands(has_wpctl(), increase) {
         run_action(prog, args).await;
     }
@@ -151,7 +232,7 @@ async fn adjust_volume(increase: bool) {
 ///
 /// Finds the touchpad device, reads its absolute-axis bounds, then processes `evdev` events
 /// to recognise three gesture zones:
-/// - **Left edge** (vertical swipe) → volume up/down via `wpctl` (`pactl` fallback)
+/// - **Left edge** (vertical swipe) → volume up/down via GNOME `uinput` or `wpctl` (`pactl` fallback)
 /// - **Right edge** (vertical swipe) → brightness up/down via KDE D-Bus, GNOME `uinput`/D-Bus, or `brightnessctl`
 /// - **Top edge** (horizontal swipe) → media previous/next via `playerctl`
 ///
@@ -171,14 +252,19 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
     };
     let (left_bound, right_bound, top_bound) = calc_edge_bounds(bounds);
 
+    let Some(mut stream) = open_event_stream(device) else {
+        return;
+    };
+
     let mut gnome_uinput = if is_gnome_desktop() {
         gnome_brightness::create_uinput_device()
     } else {
         None
     };
-
-    let Some(mut stream) = open_event_stream(device) else {
-        return;
+    let mut gnome_volume_uinput = if is_gnome_desktop() {
+        create_volume_uinput_device()
+    } else {
+        None
     };
 
     let mut state = GestureState::Idle;
@@ -247,7 +333,7 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
                             let dy = value - *last_y;
                             if dy.abs() >= STEP_THRESHOLD {
                                 *last_y = value;
-                                adjust_volume(dy < 0).await;
+                                adjust_volume(dy < 0, gnome_volume_uinput.as_mut()).await;
                             }
                         }
                         GestureState::RightEdge { last_y } => {
@@ -305,6 +391,12 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_volume_key_for_direction() {
+        assert_eq!(volume_key_for_direction(true), KeyCode::KEY_VOLUMEUP);
+        assert_eq!(volume_key_for_direction(false), KeyCode::KEY_VOLUMEDOWN);
+    }
 
     #[test]
     fn test_volume_commands_wpctl() {

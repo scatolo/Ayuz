@@ -173,6 +173,7 @@ impl Component for FanModel {
 
                     match dbus::get_fan_profile().await {
                         Ok(current) if current == saved_profile => {
+                            dbus::spawn_sync_power_profile(current);
                             out.emit(FanCommandOutput::InitialProfile(current));
                         }
                         Ok(_) => match dbus::set_fan_profile(saved_profile).await {

@@ -156,23 +156,98 @@ pub async fn get_fan_profile() -> Result<FanProfile, String> {
         .map_err(|e| t!("error_fan_profile_read", error = e.to_string()).to_string())
 }
 
+/// Maps a [`FanProfile`] to the corresponding `org.freedesktop.UPower.PowerProfiles`
+/// `ActiveProfile` identifier (`"performance"`, `"balanced"`, or `"power-saver"`).
+pub(crate) fn power_profile_name(profile: FanProfile) -> &'static str {
+    match profile {
+        FanProfile::Balanced => "balanced",
+        FanProfile::Performance => "performance",
+        FanProfile::Quiet | FanProfile::LowPower => "power-saver",
+    }
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.UPower.PowerProfiles",
+    default_service = "org.freedesktop.UPower.PowerProfiles",
+    default_path = "/org/freedesktop/UPower/PowerProfiles"
+)]
+trait PowerProfiles {
+    #[zbus(property, name = "ActiveProfile")]
+    fn active_profile(&self) -> zbus::Result<String>;
+
+    #[zbus(property, name = "ActiveProfile")]
+    fn set_active_profile(&self, value: String) -> zbus::Result<()>;
+}
+
+static POWER_PROFILE_SYNC_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static POWER_PROFILE_SYNC_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Spawns an ordered background sync of `org.freedesktop.UPower.PowerProfiles`
+/// (`ActiveProfile`) to match `profile`, gracefully ignoring errors when
+/// `PowerProfiles` (e.g. `tuned-ppd` / `power-profiles-daemon`) is unavailable.
+pub fn spawn_sync_power_profile(profile: FanProfile) {
+    let seq = POWER_PROFILE_SYNC_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    tokio::spawn(sync_power_profile_seq(profile, seq));
+}
+
+async fn sync_power_profile_seq(profile: FanProfile, seq: u64) {
+    let _guard = POWER_PROFILE_SYNC_LOCK.lock().await;
+    if POWER_PROFILE_SYNC_SEQ.load(std::sync::atomic::Ordering::SeqCst) != seq {
+        return;
+    }
+
+    let target = power_profile_name(profile);
+    let Ok(conn) = system_bus_connection().await else {
+        return;
+    };
+    let Ok(proxy) = PowerProfilesProxy::builder(&conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+    else {
+        return;
+    };
+
+    match proxy.active_profile().await {
+        Ok(current) if current == target => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!("UPower PowerProfiles unavailable; skipping sync: {e}");
+            return;
+        }
+    }
+
+    if let Err(e) = proxy.set_active_profile(target.to_string()).await {
+        tracing::warn!("Failed to sync UPower PowerProfiles to '{target}': {e}");
+    } else {
+        tracing::debug!("Synced UPower PowerProfiles ActiveProfile to '{target}'");
+    }
+}
+
 /// Applies a fan/platform profile via `asusd` and returns the applied profile on success.
 ///
 /// If the requested profile is [`FanProfile::Quiet`] and the daemon returns a
 /// `NotSupported` error (e.g. on TUF laptops that only expose `low-power`),
 /// the function automatically retries with [`FanProfile::LowPower`] and returns
 /// that variant on success.
+///
+/// Also triggers a best-effort background sync of `org.freedesktop.UPower.PowerProfiles`
+/// so desktop power-mode indicators (e.g. GNOME Quick Settings) stay aligned.
 pub async fn set_fan_profile(profile: FanProfile) -> Result<FanProfile, String> {
     let proxy = platform_proxy().await?;
-    match proxy.set_platform_profile(profile as u32).await {
-        Ok(_) => Ok(profile),
+    let applied = match proxy.set_platform_profile(profile as u32).await {
+        Ok(_) => profile,
         Err(e) if profile == FanProfile::Quiet && e.to_string().contains("NotSupported") => proxy
             .set_platform_profile(FanProfile::LowPower as u32)
             .await
             .map(|_| FanProfile::LowPower)
-            .map_err(|e2| t!("error_fan_profile_write", error = e2.to_string()).to_string()),
-        Err(e) => Err(t!("error_fan_profile_write", error = e.to_string()).to_string()),
-    }
+            .map_err(|e2| t!("error_fan_profile_write", error = e2.to_string()).to_string())?,
+        Err(e) => return Err(t!("error_fan_profile_write", error = e.to_string()).to_string()),
+    };
+    spawn_sync_power_profile(applied);
+    Ok(applied)
 }
 
 #[zbus::proxy(
@@ -856,4 +931,26 @@ pub async fn set_aura_led_power(path: &str, power: LaptopAuraPower) -> Result<()
         .set_led_power(power)
         .await
         .map_err(|e| t!("error_aura_write", error = e.to_string()).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_power_profile_name_mapping() {
+        assert_eq!(power_profile_name(FanProfile::Balanced), "balanced");
+        assert_eq!(power_profile_name(FanProfile::Performance), "performance");
+        assert_eq!(power_profile_name(FanProfile::Quiet), "power-saver");
+        assert_eq!(power_profile_name(FanProfile::LowPower), "power-saver");
+    }
+
+    #[test]
+    fn test_fan_profile_from_u32() {
+        assert_eq!(FanProfile::from(0), FanProfile::Balanced);
+        assert_eq!(FanProfile::from(1), FanProfile::Performance);
+        assert_eq!(FanProfile::from(2), FanProfile::Quiet);
+        assert_eq!(FanProfile::from(3), FanProfile::LowPower);
+        assert_eq!(FanProfile::from(99), FanProfile::Balanced);
+    }
 }
