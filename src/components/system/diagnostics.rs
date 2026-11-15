@@ -177,7 +177,13 @@ pub fn build_diagnostic_items(probe: &DiagnosticProbe) -> Vec<DiagnosticItem> {
 }
 
 async fn run_probe() -> DiagnosticProbe {
-    let (asusd_available, sensor_proxy_dbus_available) = tokio::join!(
+    let (
+        asusd_available,
+        sensor_proxy_dbus_available,
+        playerctl_installed,
+        easyeffects_installed,
+        monitor_sensor_installed,
+    ) = tokio::join!(
         async {
             tokio::time::timeout(Duration::from_secs(3), dbus::check_asusd_available())
                 .await
@@ -188,6 +194,9 @@ async fn run_probe() -> DiagnosticProbe {
                 .await
                 .unwrap_or(false)
         },
+        commands::which_exists("playerctl"),
+        commands::which_exists("easyeffects"),
+        commands::which_exists("monitor-sensor"),
     );
 
     tokio::task::spawn_blocking(move || DiagnosticProbe {
@@ -195,10 +204,10 @@ async fn run_probe() -> DiagnosticProbe {
         has_input_group: sys_paths::has_input_group(),
         can_read_input_events: sys_paths::can_read_any_input_event(),
         uinput_writable: sys_paths::is_path_writable(Path::new(sys_paths::DEV_UINPUT)),
-        playerctl_installed: commands::which_exists("playerctl"),
-        easyeffects_installed: commands::which_exists("easyeffects"),
+        playerctl_installed,
+        easyeffects_installed,
         sensor_proxy_dbus_available,
-        monitor_sensor_installed: commands::which_exists("monitor-sensor"),
+        monitor_sensor_installed,
         playerctl_install_cmd: sys_paths::package_install_command(
             "playerctl",
             "playerctl",
@@ -221,10 +230,10 @@ async fn run_probe() -> DiagnosticProbe {
         has_input_group: false,
         can_read_input_events: false,
         uinput_writable: false,
-        playerctl_installed: false,
-        easyeffects_installed: false,
+        playerctl_installed,
+        easyeffects_installed,
         sensor_proxy_dbus_available,
-        monitor_sensor_installed: false,
+        monitor_sensor_installed,
         playerctl_install_cmd: "sudo dnf install playerctl".to_string(),
         easyeffects_install_cmd: "sudo dnf install easyeffects".to_string(),
         sensor_proxy_install_cmd: "sudo dnf install iio-sensor-proxy".to_string(),

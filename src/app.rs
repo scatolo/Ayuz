@@ -44,10 +44,10 @@ use crate::components::system::diagnostics::{DiagnosticsModel, DiagnosticsMsg, D
 use crate::components::system::fan::{FanModel, FanMsg, FanOutput};
 use crate::components::system::gpu::{GpuModel, GpuMsg, GpuOutput};
 use crate::components::touchpad::gestures::GesturesMsg;
-use crate::components::touchpad::numberpad::{NumberpadModel, NumberpadMsg, NumberpadOutput};
+use crate::components::touchpad::numberpad::{NumberpadMsg, NumberpadOutput};
 use crate::components::touchpad::touchpad::TouchpadMsg;
 use crate::components::touchpad::typing::TypingMsg;
-use crate::components::touchpad::{GesturesModel, TouchpadModel, TypingModel};
+use crate::components::touchpad::{GesturesModel, NumberpadModel, TouchpadModel, TypingModel};
 use crate::search::{sorted_nav_items, SearchVisibility};
 use crate::services::commands::{is_cosmic_desktop, is_gnome_desktop, is_kde_desktop};
 use crate::services::config::AppConfig;
