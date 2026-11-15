@@ -259,6 +259,7 @@ impl SimpleComponent for AppModel {
                     window.set_visible(true);
                     window.present();
                 }
+                self.volume_widget.sender().emit(VolumeMsg::Refresh);
             }
             AppMsg::QuitApp => {
                 relm4::main_application().quit();
@@ -601,6 +602,13 @@ impl SimpleComponent for AppModel {
         content_stack.add_named(&audio_page, Some(AppPage::Audio.as_str()));
         content_stack.add_named(&system_page, Some(AppPage::System.as_str()));
         content_stack.set_visible_child_name(AppPage::Home.as_str());
+
+        let vol_sender = model.volume_widget.sender().clone();
+        content_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+            if stack.visible_child_name().as_deref() == Some(AppPage::Audio.as_str()) {
+                vol_sender.emit(VolumeMsg::Refresh);
+            }
+        });
 
         let content_header = adw::HeaderBar::new();
         let content_toolbar = adw::ToolbarView::new();

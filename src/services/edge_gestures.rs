@@ -20,14 +20,30 @@ use std::sync::OnceLock;
 use tokio::sync::watch;
 
 use crate::services::commands::{is_gnome_desktop, is_kde_desktop};
-use crate::services::evdev_runner::{find_touchpad, open_event_stream, touchpad_abs_bounds};
+use crate::services::evdev_runner::{
+    TouchpadBounds, find_touchpad, open_event_stream, touchpad_abs_ranges,
+};
 use crate::services::gnome_brightness;
 use crate::services::kde_brightness;
 
-/// Fraction of touchpad width/height that counts as an edge zone (4%)
-const EDGE_PERCENT: f64 = 0.04;
+/// Fraction of touchpad width/height that counts as an edge zone (8%)
+const EDGE_PERCENT: f64 = 0.08;
 /// Minimum movement in touchpad units required to trigger an action
 const STEP_THRESHOLD: i32 = 300;
+
+/// Computes `(left_bound, right_bound, top_bound)` from the touchpad's axis
+/// minimum/maximum bounds, ensuring non-zero or negative minimums are respected.
+pub(crate) fn calc_edge_bounds(bounds: TouchpadBounds) -> (i32, i32, i32) {
+    let x_span = (bounds.x_max as i64 - bounds.x_min as i64).max(0) as f64;
+    let y_span = (bounds.y_max as i64 - bounds.y_min as i64).max(0) as f64;
+    let x_margin = (x_span * EDGE_PERCENT).round() as i64;
+    let y_margin = (y_span * EDGE_PERCENT).round() as i64;
+    let left_bound = (bounds.x_min as i64 + x_margin).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let right_bound =
+        (bounds.x_max as i64 - x_margin).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let top_bound = (bounds.y_min as i64 + y_margin).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    (left_bound, right_bound, top_bound)
+}
 
 /// Tracks the current touch gesture as events arrive from the input device.
 enum GestureState {
@@ -135,8 +151,8 @@ async fn adjust_volume(increase: bool) {
 ///
 /// Finds the touchpad device, reads its absolute-axis bounds, then processes `evdev` events
 /// to recognise three gesture zones:
-/// - **Left edge** (vertical swipe) → volume up/down via `pactl`
-/// - **Right edge** (vertical swipe) → brightness up/down via `brightnessctl`
+/// - **Left edge** (vertical swipe) → volume up/down via `wpctl` (`pactl` fallback)
+/// - **Right edge** (vertical swipe) → brightness up/down via KDE D-Bus, GNOME `uinput`/D-Bus, or `brightnessctl`
 /// - **Top edge** (horizontal swipe) → media previous/next via `playerctl`
 ///
 /// The loop exits cleanly when `shutdown` fires (the sender's value changes).
@@ -149,13 +165,17 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
         }
     };
 
-    let (x_max, y_max) = match touchpad_abs_bounds(&device) {
+    let bounds = match touchpad_abs_ranges(&device) {
         Some(b) => b,
         None => return,
     };
-    let left_bound = (x_max as f64 * EDGE_PERCENT) as i32;
-    let right_bound = (x_max as f64 * (1.0 - EDGE_PERCENT)) as i32;
-    let top_bound = (y_max as f64 * EDGE_PERCENT) as i32;
+    let (left_bound, right_bound, top_bound) = calc_edge_bounds(bounds);
+
+    let mut gnome_uinput = if is_gnome_desktop() {
+        gnome_brightness::create_uinput_device()
+    } else {
+        None
+    };
 
     let Some(mut stream) = open_event_stream(device) else {
         return;
@@ -247,7 +267,11 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
                                     }
                                 } else if is_gnome_desktop() {
                                     if let Err(e) =
-                                        gnome_brightness::adjust_brightness_relative(delta).await
+                                        gnome_brightness::adjust_brightness_relative_with_uinput(
+                                            delta,
+                                            gnome_uinput.as_mut(),
+                                        )
+                                        .await
                                     {
                                         tracing::warn!(
                                             "GNOME brightness adjustment failed, falling back to brightnessctl: {e}"
@@ -336,5 +360,54 @@ mod tests {
             GestureState::Other => {}
             _ => panic!("Expected Other"),
         }
+    }
+
+    #[test]
+    fn test_calc_edge_bounds_zero_based() {
+        let bounds = TouchpadBounds {
+            x_min: 0,
+            x_max: 4000,
+            y_min: 0,
+            y_max: 2500,
+        };
+        assert_eq!(calc_edge_bounds(bounds), (320, 3680, 200));
+    }
+
+    #[test]
+    fn test_calc_edge_bounds_nonzero_and_negative_minimums() {
+        let positive_min = TouchpadBounds {
+            x_min: 1000,
+            x_max: 5000,
+            y_min: 1000,
+            y_max: 3500,
+        };
+        let (left, right, top) = calc_edge_bounds(positive_min);
+        assert_eq!((left, right, top), (1320, 4680, 1200));
+
+        // Ensure touches near the non-zero minimum classify as LeftEdge / TopEdge
+        let mut state = GestureState::Classifying {
+            x: Some(1100),
+            y: Some(2000),
+        };
+        try_classify(&mut state, left, right, top);
+        assert!(matches!(state, GestureState::LeftEdge { last_y: 2000 }));
+
+        let negative_min = TouchpadBounds {
+            x_min: -1000,
+            x_max: 1000,
+            y_min: -500,
+            y_max: 500,
+        };
+        assert_eq!(calc_edge_bounds(negative_min), (-840, 840, -420));
+
+        let extreme = TouchpadBounds {
+            x_min: i32::MIN,
+            x_max: i32::MAX,
+            y_min: 500,
+            y_max: 100, // reversed/invalid span should clamp cleanly without overflow
+        };
+        let (ex_left, ex_right, ex_top) = calc_edge_bounds(extreme);
+        assert!(ex_left > i32::MIN && ex_right < i32::MAX);
+        assert_eq!(ex_top, 500);
     }
 }

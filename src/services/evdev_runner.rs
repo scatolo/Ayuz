@@ -77,10 +77,36 @@ pub fn find_keyboards() -> Vec<Device> {
         .collect()
 }
 
-/// Reads the touchpad's absolute axis bounds. Prefers multi-touch
-/// (`ABS_MT_POSITION_*`) and falls back to legacy (`ABS_X/Y`). Returns
-/// `None` when either axis is missing or reports a non-positive maximum.
-pub fn touchpad_abs_bounds(device: &Device) -> Option<(i32, i32)> {
+/// Minimum and maximum reported coordinates for both touchpad axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchpadBounds {
+    pub x_min: i32,
+    pub x_max: i32,
+    pub y_min: i32,
+    pub y_max: i32,
+}
+
+/// Selects `(min, max)` from multi-touch axis info when valid (`max > min`),
+/// falling back to legacy single-touch axis info.
+pub(crate) fn select_axis_range(
+    mt_min: i32,
+    mt_max: i32,
+    leg_min: i32,
+    leg_max: i32,
+) -> Option<(i32, i32)> {
+    if mt_max > mt_min {
+        Some((mt_min, mt_max))
+    } else if leg_max > leg_min {
+        Some((leg_min, leg_max))
+    } else {
+        None
+    }
+}
+
+/// Reads the touchpad's absolute axis ranges (`minimum` and `maximum` for X and Y).
+/// Prefers multi-touch (`ABS_MT_POSITION_*`) and falls back to legacy (`ABS_X/Y`).
+/// Returns `None` when either axis is missing or reports `maximum <= minimum`.
+pub fn touchpad_abs_ranges(device: &Device) -> Option<TouchpadBounds> {
     let abs_state = match device.get_abs_state() {
         Ok(s) => s,
         Err(e) => {
@@ -88,24 +114,55 @@ pub fn touchpad_abs_bounds(device: &Device) -> Option<(i32, i32)> {
             return None;
         }
     };
-    let x_max = {
-        let mt = abs_state[AbsoluteAxisCode::ABS_MT_POSITION_X.0 as usize].maximum;
-        if mt > 0 {
-            mt
-        } else {
-            abs_state[AbsoluteAxisCode::ABS_X.0 as usize].maximum
-        }
-    };
-    let y_max = {
-        let mt = abs_state[AbsoluteAxisCode::ABS_MT_POSITION_Y.0 as usize].maximum;
-        if mt > 0 {
-            mt
-        } else {
-            abs_state[AbsoluteAxisCode::ABS_Y.0 as usize].maximum
-        }
-    };
-    if x_max <= 0 || y_max <= 0 {
+    let mt_x = abs_state[AbsoluteAxisCode::ABS_MT_POSITION_X.0 as usize];
+    let leg_x = abs_state[AbsoluteAxisCode::ABS_X.0 as usize];
+    let (x_min, x_max) =
+        select_axis_range(mt_x.minimum, mt_x.maximum, leg_x.minimum, leg_x.maximum)?;
+
+    let mt_y = abs_state[AbsoluteAxisCode::ABS_MT_POSITION_Y.0 as usize];
+    let leg_y = abs_state[AbsoluteAxisCode::ABS_Y.0 as usize];
+    let (y_min, y_max) =
+        select_axis_range(mt_y.minimum, mt_y.maximum, leg_y.minimum, leg_y.maximum)?;
+
+    Some(TouchpadBounds {
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+    })
+}
+
+/// Reads the touchpad's absolute axis upper bounds `(x_max, y_max)`. Prefers
+/// multi-touch (`ABS_MT_POSITION_*`) and falls back to legacy (`ABS_X/Y`).
+/// Returns `None` when either axis is missing or reports a non-positive maximum.
+pub fn touchpad_abs_bounds(device: &Device) -> Option<(i32, i32)> {
+    let bounds = touchpad_abs_ranges(device)?;
+    if bounds.x_max <= 0 || bounds.y_max <= 0 {
         return None;
     }
-    Some((x_max, y_max))
+    Some((bounds.x_max, bounds.y_max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_select_axis_range_prefers_multitouch() {
+        assert_eq!(select_axis_range(0, 4000, 0, 1000), Some((0, 4000)));
+        assert_eq!(select_axis_range(1000, 5000, 0, 1000), Some((1000, 5000)));
+        assert_eq!(select_axis_range(-1000, 0, 0, 1000), Some((-1000, 0)));
+    }
+
+    #[test]
+    fn test_select_axis_range_falls_back_to_legacy() {
+        assert_eq!(select_axis_range(0, 0, 0, 3200), Some((0, 3200)));
+        assert_eq!(select_axis_range(0, 0, 500, 2500), Some((500, 2500)));
+    }
+
+    #[test]
+    fn test_select_axis_range_rejects_invalid() {
+        assert_eq!(select_axis_range(0, 0, 0, 0), None);
+        assert_eq!(select_axis_range(100, 100, 200, 100), None);
+    }
 }

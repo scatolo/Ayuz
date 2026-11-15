@@ -14,9 +14,98 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use evdev::uinput::VirtualDevice;
+use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::time::{Duration, Instant};
 use zbus::zvariant::{OwnedValue, Value};
+
+/// Delay after creating a virtual uinput device so udev/libinput/Mutter have
+/// opened the new `/dev/input/event*` node before the first key event arrives.
+const UINPUT_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+/// Maps a signed brightness delta percentage to the corresponding hardware
+/// keycode and repeat count. Returns `None` for zero delta.
+pub(crate) fn uinput_key_for_delta(delta_percent: i32) -> Option<(KeyCode, usize)> {
+    if delta_percent == 0 {
+        return None;
+    }
+    let key = if delta_percent > 0 {
+        KeyCode::KEY_BRIGHTNESSUP
+    } else {
+        KeyCode::KEY_BRIGHTNESSDOWN
+    };
+    let steps = (delta_percent.unsigned_abs() / 5).max(1) as usize;
+    Some((key, steps))
+}
+
+/// Persistent `/dev/uinput` virtual device exposing `KEY_BRIGHTNESSDOWN` and
+/// `KEY_BRIGHTNESSUP`.
+///
+/// Injecting standard brightness key events lets GNOME Shell's `BrightnessManager`
+/// handle the OSD, Quick Settings slider synchronization, and auto-brightness
+/// bias offset natively (so `ambient-enabled` does not snap brightness back).
+pub struct VirtualBrightnessDevice {
+    device: VirtualDevice,
+    created_at: Instant,
+}
+
+impl VirtualBrightnessDevice {
+    /// Creates the virtual brightness-key device via `/dev/uinput`.
+    pub fn new() -> std::io::Result<Self> {
+        let keys: AttributeSet<KeyCode> = AttributeSet::from_iter([
+            KeyCode::KEY_BRIGHTNESSDOWN,
+            KeyCode::KEY_BRIGHTNESSUP,
+        ]);
+        let device = VirtualDevice::builder()?
+            .name("Ayuz Brightness Control")
+            .with_keys(&keys)?
+            .build()?;
+        Ok(Self {
+            device,
+            created_at: Instant::now(),
+        })
+    }
+
+    /// Emits brightness key press/release pairs for `delta_percent`.
+    pub async fn adjust(&mut self, delta_percent: i32) -> Result<(), String> {
+        let Some((key, steps)) = uinput_key_for_delta(delta_percent) else {
+            return Ok(());
+        };
+
+        let remaining = UINPUT_SETTLE_DELAY.saturating_sub(self.created_at.elapsed());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+
+        for _ in 0..steps {
+            let press = InputEvent::new(EventType::KEY.0, key.0, 1);
+            self.device
+                .emit(&[press])
+                .map_err(|e| format!("uinput emit press failed: {e}"))?;
+            let release = InputEvent::new(EventType::KEY.0, key.0, 0);
+            self.device
+                .emit(&[release])
+                .map_err(|e| format!("uinput emit release failed: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Attempts to create a persistent [`VirtualBrightnessDevice`] for GNOME brightness
+/// control, logging a warning and returning `None` if `/dev/uinput` is unavailable.
+pub fn create_uinput_device() -> Option<VirtualBrightnessDevice> {
+    match VirtualBrightnessDevice::new() {
+        Ok(dev) => Some(dev),
+        Err(e) => {
+            tracing::warn!(
+                "GNOME brightness uinput unavailable ({e}); falling back to D-Bus/brightnessctl"
+            );
+            None
+        }
+    }
+}
 
 /// Legacy GNOME Settings Daemon Power Screen interface (GNOME < 47 / X11).
 #[zbus::proxy(
@@ -98,6 +187,29 @@ pub fn calculate_next_backlight(min: i32, max: i32, cur: i32, delta_percent: i32
         step = if delta_percent > 0 { 1 } else { -1 };
     }
     (cur + step).clamp(min, max)
+}
+
+/// Adjusts screen brightness by `delta_percent` on GNOME.
+///
+/// Prefers `uinput` (`KEY_BRIGHTNESSUP`/`KEY_BRIGHTNESSDOWN`) when `uinput` is
+/// `Some` so GNOME Shell keeps Quick Settings, OSD, and Auto-Brightness in sync;
+/// falls back to [`adjust_brightness_relative`] (D-Bus) if `uinput` is missing
+/// or fails. Callers should fall back to `brightnessctl` if an error is returned.
+pub async fn adjust_brightness_relative_with_uinput(
+    delta_percent: i32,
+    uinput: Option<&mut VirtualBrightnessDevice>,
+) -> Result<(), String> {
+    if let Some(dev) = uinput {
+        match dev.adjust(delta_percent).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "GNOME brightness uinput emit failed ({e}); falling back to D-Bus"
+                );
+            }
+        }
+    }
+    adjust_brightness_relative(delta_percent).await
 }
 
 /// Adjusts the screen brightness by `delta_percent` (e.g. +5 or -5) via GNOME D-Bus interfaces.
@@ -209,5 +321,26 @@ mod tests {
         assert_eq!(extract_i32(&map, "max"), Some(496));
         assert_eq!(extract_i32(&map, "value"), Some(450));
         assert_eq!(extract_i32(&map, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_uinput_key_for_delta() {
+        assert_eq!(uinput_key_for_delta(0), None);
+        assert_eq!(
+            uinput_key_for_delta(5),
+            Some((KeyCode::KEY_BRIGHTNESSUP, 1))
+        );
+        assert_eq!(
+            uinput_key_for_delta(-5),
+            Some((KeyCode::KEY_BRIGHTNESSDOWN, 1))
+        );
+        assert_eq!(
+            uinput_key_for_delta(10),
+            Some((KeyCode::KEY_BRIGHTNESSUP, 2))
+        );
+        assert_eq!(
+            uinput_key_for_delta(-3),
+            Some((KeyCode::KEY_BRIGHTNESSDOWN, 1))
+        );
     }
 }

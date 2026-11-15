@@ -6,7 +6,7 @@ Repository guidance for coding agents and contributors working on **Ayuz** (`sca
 
 ## 1. Fork Identity & Target Scope
 
-- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.11` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
+- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.12` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
 - **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 · GNOME (Wayland)**.
 - **Upstream Target Retained**: **ASUS Zenbook S16** running **Fedora 43 · KDE Plasma (Wayland)** (and COSMIC where supported).
 - **Explicit Scope Boundaries**:
@@ -112,9 +112,9 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
 | `src/services/commands.rs` | `run_command_blocking`, `&'static str`-guarded `pkexec_read_file` / `pkexec_write_sysfs`, `which_exists`, `resolve_qdbus_path`, `is_kde_desktop` / `is_gnome_desktop` / `is_cosmic_desktop`. |
 | `src/services/dbus.rs` | `zbus` system-bus proxies for `xyz.ljones.Asusd` (`Platform`, `FanProfile`, charge limit, `AsusArmoury` `apu_mem`, `Aura` discovery/control) and `org.supergfxctl.Daemon` (`GfxMode`). |
 | `src/services/dbus_animatrix.rs` | DMI AniMatrix board detection (`detect_animatrix_hardware`) and `zbus` proxy (`xyz.ljones.Anime`) for AniMatrix controls and GIF frame streaming. |
-| `src/services/evdev_runner.rs` | Shared `/dev/input/` helpers (`find_touchpad` skipping `ayuz*` virtual devices, `find_keyboards`, `touchpad_abs_bounds`, `open_event_stream`). |
-| `src/services/edge_gestures.rs` | Touchpad edge-swipe loop: left edge = volume (`wpctl` preferred, `pactl` fallback), right edge = brightness (KDE D-Bus / GNOME D-Bus / `brightnessctl`), top edge = media (`playerctl`). |
-| `src/services/gnome_brightness.rs` | Session D-Bus brightness via `org.gnome.SettingsDaemon.Power.Screen` with fallback to `org.gnome.Mutter.DisplayConfig` (`Backlight` / `SetBacklight` for GNOME 47+ Wayland). |
+| `src/services/evdev_runner.rs` | Shared `/dev/input/` helpers (`find_touchpad` skipping `ayuz*` virtual devices, `find_keyboards`, `touchpad_abs_ranges`, `touchpad_abs_bounds`, `open_event_stream`). |
+| `src/services/edge_gestures.rs` | Touchpad edge-swipe loop: left edge = volume (`wpctl` preferred, `pactl` fallback), right edge = brightness (KDE D-Bus / GNOME `uinput` + D-Bus / `brightnessctl`), top edge = media (`playerctl`). |
+| `src/services/gnome_brightness.rs` | GNOME brightness control via `/dev/uinput` (`KEY_BRIGHTNESSUP`/`KEY_BRIGHTNESSDOWN`) with session D-Bus fallback (`org.gnome.SettingsDaemon.Power.Screen` and `org.gnome.Mutter.DisplayConfig`). |
 | `src/services/kde_brightness.rs` | KDE PowerDevil D-Bus brightness control (`org.kde.Solid.PowerManagement.Actions.BrightnessControl`). |
 | `src/services/touchpad_ctl.rs` | DE-agnostic touchpad enable/disable (`gsettings` on GNOME, `qdbus` on KDE). |
 | `src/services/typing_watch.rs` | Keyboard monitoring (`KEY_ESC`..`KEY_COMPOSE` excluding modifiers) for palm rejection (suppresses edge gestures and/or disables touchpad while typing). |
@@ -125,7 +125,7 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
 | `src/components/keyboard/` | `auto_backlight.rs` (`iio-sensor-proxy` + `logind` lock check), `backlight_idle.rs` (`swayidle` + UPower D-Bus), `fn_key.rs` (`pkexec grubby` `asus_wmi.fnlock_default`). |
 | `src/components/aura/`, `animatrix/` | Dynamic `asusd` Aura RGB device pages (`aura_page.rs`, `aura_device.rs`) and AniMatrix LED matrix controls + GIF gallery (`animatrix.rs`). |
 | `src/components/touchpad/` | `touchpad.rs` (10s auto-revert safety timer), `numberpad.rs`, `gestures.rs` (requires `playerctl`; brightness gate satisfied on GNOME/KDE or `brightnessctl`), `typing.rs`. |
-| `src/components/audio/`, `system/` | `volume.rs` (`wpctl` + optional `pactl subscribe` listener), `sound_modes.rs` (`easyeffects`), `battery.rs` (`asusd` charge limit + `/sys/power/mem_sleep`), `fan.rs` + `fan_osd.rs` (`gtk4-layer-shell` with regular window fallback), `gpu.rs` (`supergfxctl`), `apu_mem.rs` (`asusd`). |
+| `src/components/audio/`, `system/` | `volume.rs` (`wpctl` + `pactl subscribe` with `wpctl` polling fallback), `sound_modes.rs` (`easyeffects`), `battery.rs` (`asusd` charge limit + `/sys/power/mem_sleep`), `fan.rs` + `fan_osd.rs` (`gtk4-layer-shell` with regular window fallback), `gpu.rs` (`supergfxctl`), `apu_mem.rs` (`asusd`). |
 | `locales/` | `en.yml`, `de.yml`, `pt-br.yml` (`rust-i18n`, fallback `"en"`). |
 | `packaging/`, `.github/workflows/` | `.desktop` files, AppStream metainfo (`de.guido.ayuz.metainfo.xml`), `udev/99-ayuz-numberpad.rules`, `release.yml`, plus root `dist-workspace.toml` and `flake.nix`. |
 | `assets/` | `style.css`, `trayicon.png`, `img/`, `icm/`, `presets/` (EasyEffects), `anime/` (AniMatrix GIFs/images). |
