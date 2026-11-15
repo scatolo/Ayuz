@@ -6,7 +6,7 @@ Repository guidance for coding agents and contributors working on **Ayuz** (`sca
 
 ## 1. Fork Identity & Target Scope
 
-- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.10-ux3405.1` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
+- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.11` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
 - **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 · GNOME (Wayland)**.
 - **Upstream Target Retained**: **ASUS Zenbook S16** running **Fedora 43 · KDE Plasma (Wayland)** (and COSMIC where supported).
 - **Explicit Scope Boundaries**:
@@ -82,9 +82,15 @@ CI workflow `.github/workflows/release.yml` runs on pushes to `main`, tags match
     VERSION="${PKG_VERSION}" ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 cargo appimage
     ```
 
-**Version bump rule**: Because CI runs all Cargo steps with `--locked`, whenever you bump the version keep all three synchronized:
-1. `Cargo.toml` `[package].version` (e.g. `1.1.10-ux3405.1`)
-2. `Cargo.toml` `[package.metadata.generate-rpm].version` (`-` replaced with `+`, e.g. `1.1.10+ux3405.1`)
+**Version bump rule**: On pushes to `main`, `.github/workflows/release.yml` only runs `build-rpm`, `build-deb`, `build-appimage`, and `release` when tag `v<version>` does not yet exist on `origin` (`should_release == 'true'`). Whenever a change on `main` should produce a new release, **always bump the version** following standard **Semantic Versioning (`MAJOR.MINOR.PATCH`)**:
+- **`MAJOR`** (`X.0.0`): breaking or incompatible changes (resets `MINOR` and `PATCH` to `0`).
+- **`MINOR`** (`x.Y.0`): new backwards-compatible features or enhancements (resets `PATCH` to `0`).
+- **`PATCH`** (`x.y.Z`): bug fixes, small improvements, and maintenance updates (including upstream fix backports).
+- If a fork suffix like `-ux3405.<N>` is present, bump `MAJOR.MINOR.PATCH` according to the rules above (dropping or resetting `-ux3405.1` if appropriate, or incrementing `.N` only for fork-specific packaging/CI rebuilds of the same code).
+
+Because CI runs all Cargo steps with `--locked`, whenever you bump the version keep all three synchronized:
+1. `Cargo.toml` `[package].version` (e.g. `1.1.11` or `1.1.10-ux3405.2`)
+2. `Cargo.toml` `[package.metadata.generate-rpm].version` (`-` replaced with `+` if a hyphenated suffix is used, e.g. `1.1.11` or `1.1.10+ux3405.2`)
 3. `Cargo.lock` root `ayuz` package version
 
 Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app.rs`, `flake.nix`, and `packaging/de.guido.ayuz.metainfo.xml` still retain upstream `Traciges/Ayuz` metadata/release history.
@@ -141,3 +147,4 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
    - Add widget to `widget_map` in `src/app.rs` and to `SEARCH_INDEX` in `src/search.rs`.
    - Add translation keys to **all three** files: `locales/en.yml`, `locales/de.yml`, and `locales/pt-br.yml`.
 9. **Headless unit tests**: CI runs `cargo test --locked` inside `quay.io/fedora/fedora:44` with no display server, no D-Bus session/system services, and no ASUS hardware. Keep unit tests decoupled from live `/sys`, `/dev`, D-Bus, and GTK display initialization (follow the mock-directory pattern in `src/sys_paths.rs` and pure-function tests in `src/services/gnome_brightness.rs`, `src/services/edge_gestures.rs`, and `src/services/numberpad_layouts.rs`).
+10. **End-of-session Git commands**: Whenever a session modifies repository files, end the final response with ready-to-run, clean `git add`, `git commit`, and `git push` commands (scoping `git add` explicitly to the modified files and suggesting a clear, concise commit message).
