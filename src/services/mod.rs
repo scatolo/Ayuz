@@ -28,5 +28,6 @@ pub mod migration;
 pub mod numberpad;
 pub mod numberpad_layouts;
 pub mod numberpad_pointer;
+pub mod power_auto;
 pub mod touchpad_ctl;
 pub mod typing_watch;

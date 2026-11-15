@@ -252,6 +252,14 @@ pub struct AppConfig {
     pub fan_osd_enabled: bool,
     #[serde(default = "default_true")]
     pub fan_hotkey_enabled: bool,
+    #[serde(default)]
+    pub hide_unsupported_hardware: bool,
+    #[serde(default)]
+    pub power_auto_switch_enabled: bool,
+    #[serde(default)]
+    pub ac_profile_id: Option<String>,
+    #[serde(default)]
+    pub battery_profile_id: Option<String>,
 
     // ── Profile management ───────────────────────────────────────────────────
     #[serde(default)]
@@ -267,6 +275,10 @@ impl Default for AppConfig {
             skip_legacy_migration: false,
             fan_osd_enabled: true,
             fan_hotkey_enabled: true,
+            hide_unsupported_hardware: false,
+            power_auto_switch_enabled: false,
+            ac_profile_id: None,
+            battery_profile_id: None,
             active_profile_id: String::new(),
             profiles: vec![],
         }
@@ -436,5 +448,39 @@ mod tests {
         assert_eq!(parsed.display_refresh_hz, Some(60));
         assert_eq!(parsed.gnome_screen_blank_secs, Some(120));
         assert_eq!(parsed.gnome_ambient_brightness, Some(true));
+    }
+
+    #[test]
+    fn test_app_config_deserializes_without_section3_fields() {
+        let legacy_json = r#"{
+            "language": "en",
+            "skip_legacy_migration": true,
+            "active_profile_id": "p1",
+            "profiles": []
+        }"#;
+
+        let cfg: AppConfig = serde_json::from_str(legacy_json).expect("valid legacy app config");
+        assert!(!cfg.hide_unsupported_hardware);
+        assert!(!cfg.power_auto_switch_enabled);
+        assert_eq!(cfg.ac_profile_id, None);
+        assert_eq!(cfg.battery_profile_id, None);
+    }
+
+    #[test]
+    fn test_app_config_roundtrip_with_section3_fields() {
+        let cfg = AppConfig {
+            hide_unsupported_hardware: true,
+            power_auto_switch_enabled: true,
+            ac_profile_id: Some("ac1".to_string()),
+            battery_profile_id: Some("bat1".to_string()),
+            ..AppConfig::default()
+        };
+
+        let serialized = serde_json::to_string(&cfg).expect("serialize app config");
+        let parsed: AppConfig = serde_json::from_str(&serialized).expect("deserialize app config");
+        assert!(parsed.hide_unsupported_hardware);
+        assert!(parsed.power_auto_switch_enabled);
+        assert_eq!(parsed.ac_profile_id.as_deref(), Some("ac1"));
+        assert_eq!(parsed.battery_profile_id.as_deref(), Some("bat1"));
     }
 }

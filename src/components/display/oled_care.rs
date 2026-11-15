@@ -76,6 +76,7 @@ pub struct OledCareModel {
     kde_available: bool,
     panel_ctrl_available: bool,
     gnome_available: bool,
+    hide_unsupported: bool,
     screen_blank_combo: adw::ComboRow,
     suppress_signals: Rc<Cell<bool>>,
 }
@@ -87,6 +88,7 @@ pub enum OledCareMsg {
     ToggleTransparency(bool),
     SelectScreenBlank(u32),
     ToggleGnomeAmbient(bool),
+    SetHideUnsupported(bool),
     Refresh,
     LoadProfile {
         pixel_refresh: bool,
@@ -175,6 +177,8 @@ impl Component for OledCareModel {
             #[template]
             add = &crate::components::widgets::DaemonWarningLabel {
                 set_label: &t!("oled_care_group_notice"),
+                #[watch]
+                set_visible: !model.hide_unsupported || (!model.gnome_available && !model.panel_ctrl_available),
             },
 
             add = &model.screen_blank_combo.clone() -> adw::ComboRow {
@@ -182,6 +186,8 @@ impl Component for OledCareModel {
                 set_subtitle: &t!("oled_care_screen_blank_subtitle"),
                 #[watch]
                 set_sensitive: model.gnome_available,
+                #[watch]
+                set_visible: !model.hide_unsupported || model.gnome_available,
             },
 
             add = &adw::SwitchRow {
@@ -191,6 +197,8 @@ impl Component for OledCareModel {
                 set_active: model.gnome_ambient_active,
                 #[watch]
                 set_sensitive: model.gnome_available,
+                #[watch]
+                set_visible: !model.hide_unsupported || model.gnome_available,
 
                 connect_active_notify[sender] => move |switch| {
                     sender.input(OledCareMsg::ToggleGnomeAmbient(switch.is_active()));
@@ -205,6 +213,8 @@ impl Component for OledCareModel {
                 set_active: model.pixel_refresh_active,
                 #[watch]
                 set_sensitive: model.kde_available,
+                #[watch]
+                set_visible: !model.hide_unsupported || model.kde_available,
 
                 connect_active_notify[sender] => move |switch| {
                     sender.input(OledCareMsg::TogglePixelRefresh(switch.is_active()));
@@ -219,6 +229,8 @@ impl Component for OledCareModel {
                 set_active: model.panel_autohide_active,
                 #[watch]
                 set_sensitive: model.panel_ctrl_available,
+                #[watch]
+                set_visible: !model.hide_unsupported || model.panel_ctrl_available,
 
                 connect_active_notify[sender] => move |switch| {
                     sender.input(OledCareMsg::TogglePanelAutohide(switch.is_active()));
@@ -233,6 +245,8 @@ impl Component for OledCareModel {
                 set_active: model.transparency_active,
                 #[watch]
                 set_sensitive: model.panel_ctrl_available,
+                #[watch]
+                set_visible: !model.hide_unsupported || model.panel_ctrl_available,
 
                 connect_active_notify[sender] => move |switch| {
                     sender.input(OledCareMsg::ToggleTransparency(switch.is_active()));
@@ -276,6 +290,7 @@ impl Component for OledCareModel {
             kde_available: kde,
             panel_ctrl_available: kde || cosmic,
             gnome_available: gnome,
+            hide_unsupported: config.hide_unsupported_hardware,
             screen_blank_combo,
             suppress_signals,
         };
@@ -557,6 +572,9 @@ impl Component for OledCareModel {
                             .drop_on_shutdown()
                     });
                 }
+            }
+            OledCareMsg::SetHideUnsupported(hide) => {
+                self.hide_unsupported = hide;
             }
         }
     }

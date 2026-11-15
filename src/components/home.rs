@@ -97,6 +97,7 @@ pub struct HomeModel {
 pub enum HomeOutput {
     Error(String),
     ActivateProfile(String),
+    ProfilesChanged,
 }
 
 #[derive(Debug)]
@@ -781,6 +782,7 @@ impl Component for HomeModel {
                             c.profiles.push(new_profile);
                         });
                         sender_clone.input(HomeMsg::RefreshProfiles);
+                        let _ = sender_clone.output(HomeOutput::ProfilesChanged);
                     }
                 });
             }
@@ -819,6 +821,7 @@ impl Component for HomeModel {
                     }
                 });
                 sender.input(HomeMsg::RefreshProfiles);
+                let _ = sender.output(HomeOutput::ProfilesChanged);
             }
 
             HomeMsg::ChangeProfileIcon { id } => {
@@ -889,15 +892,27 @@ impl Component for HomeModel {
                 glib::spawn_future_local(async move {
                     let response = dialog.choose_future(None::<&gtk::Widget>).await;
                     if &*response == "delete" {
+                        let mut fallback_active: Option<String> = None;
                         AppConfig::update(|c| {
                             c.profiles.retain(|p| p.id != id);
+                            if c.ac_profile_id.as_deref() == Some(id.as_str()) {
+                                c.ac_profile_id = None;
+                            }
+                            if c.battery_profile_id.as_deref() == Some(id.as_str()) {
+                                c.battery_profile_id = None;
+                            }
                             if c.active_profile_id == id {
                                 if let Some(first) = c.profiles.first() {
                                     c.active_profile_id = first.id.clone();
+                                    fallback_active = Some(first.id.clone());
                                 }
                             }
                         });
                         sender_clone.input(HomeMsg::RefreshProfiles);
+                        let _ = sender_clone.output(HomeOutput::ProfilesChanged);
+                        if let Some(next_id) = fallback_active {
+                            let _ = sender_clone.output(HomeOutput::ActivateProfile(next_id));
+                        }
                     }
                 });
             }

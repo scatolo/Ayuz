@@ -14,52 +14,46 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use crate::components::audio::{SoundModesModel, SoundModesMsg, VolumeModel};
-use crate::components::display::ColorGamutModel;
-use crate::components::display::OledCareModel;
-use crate::components::display::OledDimmingModel;
-use crate::components::display::RefreshRateModel;
-use crate::components::display::TargetModeModel;
-use crate::components::home::{HomeModel, HomeMsg, HomeOutput};
+use crate::components::animatrix::{AnimatrixModel, AnimatrixMsg};
 use crate::components::audio::volume::VolumeMsg;
+use crate::components::audio::{SoundModesModel, SoundModesMsg, VolumeModel};
+use crate::components::aura::aura_page::AuraPageOutput;
+use crate::components::aura::{AuraPageModel, AuraPageMsg};
 use crate::components::display::color_gamut::ColorGamutMsg;
 use crate::components::display::oled_care::OledCareMsg;
 use crate::components::display::oled_dimming::OledDimmingMsg;
 use crate::components::display::refresh_rate::RefreshRateMsg;
 use crate::components::display::target_mode::TargetModeMsg;
-use crate::components::keyboard::auto_backlight::AutoBacklightMsg;
-use crate::components::keyboard::auto_backlight::AutoBacklightOutput;
+use crate::components::display::{
+    ColorGamutModel, OledCareModel, OledDimmingModel, RefreshRateModel, TargetModeModel,
+};
+use crate::components::home::{HomeModel, HomeMsg, HomeOutput};
+use crate::components::keyboard::auto_backlight::{AutoBacklightMsg, AutoBacklightOutput};
 use crate::components::keyboard::backlight_idle::BacklightIdleMsg;
 use crate::components::keyboard::fn_key::FnKeyMsg;
+use crate::components::keyboard::{AutoBacklightModel, BacklightIdleModel, FnKeyModel};
+use crate::components::system::apu_mem::{ApuMemModel, ApuMemMsg, ApuMemOutput};
+use crate::components::system::armoury::{ArmouryModel, ArmouryMsg};
+use crate::components::system::battery::{BatteryModel, BatteryMsg, BatteryOutput};
+use crate::components::system::diagnostics::{DiagnosticsModel, DiagnosticsMsg, DiagnosticsOutput};
+use crate::components::system::fan::{FanModel, FanMsg, FanOutput};
+use crate::components::system::gpu::{GpuModel, GpuMsg, GpuOutput};
 use crate::components::touchpad::gestures::GesturesMsg;
-use crate::components::touchpad::numberpad::NumberpadMsg;
+use crate::components::touchpad::numberpad::{NumberpadModel, NumberpadMsg, NumberpadOutput};
 use crate::components::touchpad::touchpad::TouchpadMsg;
 use crate::components::touchpad::typing::TypingMsg;
-use crate::components::system::apu_mem::ApuMemMsg;
-use crate::components::system::armoury::ArmouryMsg;
-use crate::components::system::battery::BatteryMsg;
-use crate::components::system::fan::FanMsg;
-use crate::components::system::gpu::GpuMsg;
+use crate::components::touchpad::{GesturesModel, TouchpadModel, TypingModel};
+use crate::search::{sorted_nav_items, SearchVisibility};
+use crate::services::commands::{is_cosmic_desktop, is_gnome_desktop, is_kde_desktop};
+use crate::services::config::AppConfig;
 use crate::services::dbus::FanProfile;
-use crate::components::animatrix::{AnimatrixModel, AnimatrixMsg};
-use crate::components::aura::AuraPageModel;
-use crate::components::aura::AuraPageMsg;
-use crate::components::keyboard::AutoBacklightModel;
-use crate::components::keyboard::BacklightIdleModel;
-use crate::components::keyboard::FnKeyModel;
-use crate::components::touchpad::GesturesModel;
-use crate::components::touchpad::NumberpadModel;
-use crate::components::touchpad::TouchpadModel;
-use crate::components::touchpad::TypingModel;
-use crate::components::system::apu_mem::ApuMemModel;
-use crate::components::system::armoury::ArmouryModel;
-use crate::components::system::battery::BatteryModel;
-use crate::components::system::fan::FanModel;
-use crate::components::system::gpu::GpuModel;
-use crate::search::sorted_nav_items;
+use crate::services::dbus_animatrix::{detect_animatrix_hardware, AnimatrixHardwareType};
+use crate::services::power_auto::{self, PowerAutoSettings};
 use crate::tray;
 use relm4::adw;
 use relm4::adw::prelude::*;
@@ -114,14 +108,177 @@ impl AppPage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportSlot {
+    Aura,
+    Gpu,
+    ApuMem,
+    Numberpad,
+}
+
+#[derive(Debug, Clone)]
+struct HardwareSupportState {
+    animatrix_supported: bool,
+    aura_supported: Option<bool>,
+    gpu_supported: Option<bool>,
+    apu_mem_supported: Option<bool>,
+    numberpad_supported: Option<bool>,
+    kde_available: bool,
+    cosmic_available: bool,
+    gnome_available: bool,
+}
+
+struct PowerAutoControls {
+    group: adw::PreferencesGroup,
+    enabled_row: adw::SwitchRow,
+    ac_combo: adw::ComboRow,
+    battery_combo: adw::ComboRow,
+    profile_ids: Rc<RefCell<Vec<Option<String>>>>,
+    suppress_signals: Rc<Cell<bool>>,
+}
+
+impl PowerAutoControls {
+    fn new(sender: &ComponentSender<AppModel>, config: &AppConfig) -> Self {
+        let group = adw::PreferencesGroup::new();
+        group.set_title(&gtk4::glib::markup_escape_text(&t!("power_auto_group_title")));
+        group.set_description(Some(&t!("power_auto_group_desc")));
+
+        let enabled_row = adw::SwitchRow::new();
+        enabled_row.set_title(&t!("power_auto_enable_title"));
+
+        let ac_combo = adw::ComboRow::new();
+        ac_combo.set_title(&t!("power_auto_ac_title"));
+
+        let battery_combo = adw::ComboRow::new();
+        battery_combo.set_title(&t!("power_auto_battery_title"));
+
+        group.add(&enabled_row);
+        group.add(&ac_combo);
+        group.add(&battery_combo);
+
+        let controls = Self {
+            group,
+            enabled_row,
+            ac_combo,
+            battery_combo,
+            profile_ids: Rc::new(RefCell::new(Vec::new())),
+            suppress_signals: Rc::new(Cell::new(false)),
+        };
+        controls.sync_from_config(config);
+
+        let sender_en = sender.clone();
+        let suppress_en = controls.suppress_signals.clone();
+        controls.enabled_row.connect_active_notify(move |row| {
+            if suppress_en.get() {
+                return;
+            }
+            sender_en.input(AppMsg::TogglePowerAutoSwitch(row.is_active()));
+        });
+
+        let sender_ac = sender.clone();
+        let suppress_ac = controls.suppress_signals.clone();
+        let ids_ac = controls.profile_ids.clone();
+        controls.ac_combo.connect_selected_notify(move |row| {
+            if suppress_ac.get() {
+                return;
+            }
+            let idx = row.selected() as usize;
+            let id = ids_ac.borrow().get(idx).cloned().flatten();
+            sender_ac.input(AppMsg::SetAcProfile(id));
+        });
+
+        let sender_bat = sender.clone();
+        let suppress_bat = controls.suppress_signals.clone();
+        let ids_bat = controls.profile_ids.clone();
+        controls.battery_combo.connect_selected_notify(move |row| {
+            if suppress_bat.get() {
+                return;
+            }
+            let idx = row.selected() as usize;
+            let id = ids_bat.borrow().get(idx).cloned().flatten();
+            sender_bat.input(AppMsg::SetBatteryProfile(id));
+        });
+
+        controls
+    }
+
+    fn sync_from_config(&self, config: &AppConfig) {
+        self.suppress_signals.set(true);
+
+        self.enabled_row.set_active(config.power_auto_switch_enabled);
+        self.ac_combo.set_sensitive(config.power_auto_switch_enabled);
+        self.battery_combo
+            .set_sensitive(config.power_auto_switch_enabled);
+
+        let mut labels = vec![t!("power_auto_none").to_string()];
+        let mut ids: Vec<Option<String>> = vec![None];
+        for profile in &config.profiles {
+            labels.push(profile.name.clone());
+            ids.push(Some(profile.id.clone()));
+        }
+
+        let str_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        self.ac_combo
+            .set_model(Some(&gtk4::StringList::new(&str_refs)));
+        self.battery_combo
+            .set_model(Some(&gtk4::StringList::new(&str_refs)));
+
+        let ac_idx = index_for_profile(&ids, config.ac_profile_id.as_deref());
+        let bat_idx = index_for_profile(&ids, config.battery_profile_id.as_deref());
+        self.ac_combo.set_selected(ac_idx);
+        self.battery_combo.set_selected(bat_idx);
+
+        *self.profile_ids.borrow_mut() = ids;
+        self.suppress_signals.set(false);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.suppress_signals.set(true);
+        self.enabled_row.set_active(enabled);
+        self.ac_combo.set_sensitive(enabled);
+        self.battery_combo.set_sensitive(enabled);
+        self.suppress_signals.set(false);
+    }
+}
+
+fn index_for_profile(ids: &[Option<String>], target: Option<&str>) -> u32 {
+    match target {
+        Some(t) => ids
+            .iter()
+            .position(|entry| entry.as_deref() == Some(t))
+            .unwrap_or(0) as u32,
+        None => 0,
+    }
+}
+
 #[derive(Debug)]
 pub enum AppMsg {
     ShowWindow,
     QuitApp,
     Error(String),
+    Toast(String),
     SetLanguage(String),
     ToggleAutostart(bool),
+    ToggleHideUnsupported(bool),
+    TogglePowerAutoSwitch(bool),
+    SetAcProfile(Option<String>),
+    SetBatteryProfile(Option<String>),
     ActivateProfile(String),
+    ProfilesChanged,
+    SetFanProfileFromTray(FanProfile),
+    ToggleBatteryMaintenanceFromTray,
+    FanStateChanged {
+        profile: FanProfile,
+        asusd_available: bool,
+    },
+    BatteryStateChanged {
+        limit: u8,
+        asusd_available: bool,
+    },
+    HardwareSupportUpdated {
+        slot: SupportSlot,
+        supported: bool,
+    },
     LegacyMigrationAccepted,
     LegacyMigrationDeclined,
     TriggerManualMigration,
@@ -133,11 +290,24 @@ pub struct AppModel {
     start_hidden: bool,
     window: gtk4::glib::WeakRef<adw::ApplicationWindow>,
     toast_overlay: adw::ToastOverlay,
-    _tray: ksni::Handle<tray::AyuzTray>,
+    tray: ksni::Handle<tray::AyuzTray>,
+    tray_fan_profile: FanProfile,
+    tray_fan_available: bool,
+    tray_battery_limit: u8,
+    tray_battery_available: bool,
+    sidebar_list: gtk4::ListBox,
+    sidebar_rows: HashMap<&'static str, gtk4::ListBoxRow>,
+    content_stack: adw::ViewStack,
+    search_visibility: Rc<RefCell<SearchVisibility>>,
+    hide_unsupported_hardware: bool,
+    hardware_support: HardwareSupportState,
+    power_auto_tx: tokio::sync::watch::Sender<PowerAutoSettings>,
+    power_auto_controls: PowerAutoControls,
     home: Controller<HomeModel>,
     apu_mem: Controller<ApuMemModel>,
     armoury: Controller<ArmouryModel>,
     battery: Controller<BatteryModel>,
+    diagnostics: Controller<DiagnosticsModel>,
     fan: Controller<FanModel>,
     gpu: Controller<GpuModel>,
     refresh_rate: Controller<RefreshRateModel>,
@@ -159,6 +329,121 @@ pub struct AppModel {
 }
 
 impl AppModel {
+    fn build_tray_state(&self) -> tray::TrayState {
+        let config = AppConfig::load();
+        let profiles = config
+            .profiles
+            .iter()
+            .map(|p| tray::TrayProfileEntry {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                active: p.id == config.active_profile_id,
+            })
+            .collect();
+        tray::TrayState {
+            profiles,
+            fan_profile: self.tray_fan_profile,
+            fan_available: self.tray_fan_available,
+            battery_limit: self.tray_battery_limit,
+            battery_available: self.tray_battery_available,
+        }
+    }
+
+    fn sync_tray_state(&self) {
+        let state = self.build_tray_state();
+        self.tray.update(move |tray| {
+            tray.state = state;
+        });
+    }
+
+    fn send_power_auto_settings(&self, config: &AppConfig) {
+        let next = PowerAutoSettings::from(config);
+        self.power_auto_tx.send_if_modified(|cur| {
+            if *cur == next {
+                false
+            } else {
+                *cur = next;
+                true
+            }
+        });
+    }
+
+    fn apply_hardware_visibility(&self) {
+        let hide = self.hide_unsupported_hardware;
+        let animatrix_visible = !hide || self.hardware_support.animatrix_supported;
+        let aura_visible = !hide || self.hardware_support.aura_supported.unwrap_or(true);
+        let gpu_visible = !hide || self.hardware_support.gpu_supported.unwrap_or(true);
+        let apu_mem_visible = !hide || self.hardware_support.apu_mem_supported.unwrap_or(true);
+        let numberpad_visible = !hide || self.hardware_support.numberpad_supported.unwrap_or(true);
+        let kde_visible = !hide || self.hardware_support.kde_available;
+        let panel_ctrl_visible =
+            !hide || self.hardware_support.kde_available || self.hardware_support.cosmic_available;
+        let gnome_visible = !hide || self.hardware_support.gnome_available;
+
+        if let Some(row) = self.sidebar_rows.get("animatrix") {
+            row.set_visible(animatrix_visible);
+        }
+        if let Some(row) = self.sidebar_rows.get("aura") {
+            row.set_visible(aura_visible);
+        }
+        self.sidebar_list.invalidate_headers();
+
+        self.gpu.widget().set_visible(gpu_visible);
+        self.apu_mem.widget().set_visible(apu_mem_visible);
+        self.numberpad.widget().set_visible(numberpad_visible);
+        self.oled_dimming.widget().set_visible(kde_visible);
+        self.target_mode.widget().set_visible(kde_visible);
+        self.color_gamut.widget().set_visible(kde_visible);
+        self.oled_care
+            .sender()
+            .emit(OledCareMsg::SetHideUnsupported(hide));
+
+        {
+            let mut vis = self.search_visibility.borrow_mut();
+            vis.hidden_pages.clear();
+            vis.hidden_components.clear();
+            vis.hidden_title_keys.clear();
+
+            if !animatrix_visible {
+                vis.hidden_pages.insert("animatrix");
+                vis.hidden_components.insert("animatrix");
+            }
+            if !aura_visible {
+                vis.hidden_pages.insert("aura");
+                vis.hidden_components.insert("aura");
+            }
+            if !gpu_visible {
+                vis.hidden_components.insert("gpu");
+            }
+            if !apu_mem_visible {
+                vis.hidden_components.insert("apu_mem");
+            }
+            if !numberpad_visible {
+                vis.hidden_components.insert("numberpad");
+            }
+            if !kde_visible {
+                vis.hidden_components.insert("oled_dimming");
+                vis.hidden_components.insert("target_mode");
+                vis.hidden_components.insert("color_gamut");
+                vis.hidden_title_keys.insert("oled_care_pixel_refresh_title");
+            }
+            if !panel_ctrl_visible {
+                vis.hidden_title_keys.insert("oled_care_panel_autohide_title");
+                vis.hidden_title_keys.insert("oled_care_transparency_title");
+            }
+            if !gnome_visible {
+                vis.hidden_title_keys.insert("oled_care_screen_blank_title");
+                vis.hidden_title_keys.insert("oled_care_ambient_brightness_title");
+            }
+
+            if let Some(current) = self.content_stack.visible_child_name()
+                && vis.hidden_pages.contains(current.as_str())
+                && let Some(home_row) = self.sidebar_rows.get("home")
+            {
+                self.sidebar_list.select_row(Some(home_row));
+            }
+        }
+    }
     /// Broadcasts the active profile's settings to every sub-component.
     ///
     /// Each `LoadProfile` message is the canonical entry point that tells a
@@ -274,6 +559,7 @@ impl SimpleComponent for AppModel {
                 self.battery.sender().emit(BatteryMsg::RefreshStats);
                 self.fan.sender().emit(FanMsg::RefreshTelemetry);
                 self.armoury.sender().emit(ArmouryMsg::Refresh);
+                self.diagnostics.sender().emit(DiagnosticsMsg::Refresh);
             }
             AppMsg::QuitApp => {
                 relm4::main_application().quit();
@@ -284,8 +570,13 @@ impl SimpleComponent for AppModel {
                 toast.set_timeout(5);
                 self.toast_overlay.add_toast(toast);
             }
+            AppMsg::Toast(text) => {
+                let toast = adw::Toast::new(&text);
+                toast.set_timeout(4);
+                self.toast_overlay.add_toast(toast);
+            }
             AppMsg::SetLanguage(lang) => {
-                crate::services::config::AppConfig::update(|c| {
+                AppConfig::update(|c| {
                     c.language = lang.clone();
                 });
                 rust_i18n::set_locale(&lang);
@@ -296,10 +587,102 @@ impl SimpleComponent for AppModel {
             AppMsg::ToggleAutostart(state) => {
                 crate::autostart::set_enabled(state);
             }
+            AppMsg::ToggleHideUnsupported(active) => {
+                if active == self.hide_unsupported_hardware {
+                    return;
+                }
+                self.hide_unsupported_hardware = active;
+                AppConfig::update(|c| {
+                    c.hide_unsupported_hardware = active;
+                });
+                self.apply_hardware_visibility();
+            }
+            AppMsg::TogglePowerAutoSwitch(active) => {
+                if self.power_auto_tx.borrow().enabled == active {
+                    return;
+                }
+                AppConfig::update(|c| {
+                    c.power_auto_switch_enabled = active;
+                });
+                let config = AppConfig::load();
+                self.power_auto_controls.set_enabled(active);
+                self.send_power_auto_settings(&config);
+            }
+            AppMsg::SetAcProfile(id) => {
+                if self.power_auto_tx.borrow().ac_profile_id == id {
+                    return;
+                }
+                AppConfig::update(|c| {
+                    c.ac_profile_id = id;
+                });
+                let config = AppConfig::load();
+                self.send_power_auto_settings(&config);
+            }
+            AppMsg::SetBatteryProfile(id) => {
+                if self.power_auto_tx.borrow().battery_profile_id == id {
+                    return;
+                }
+                AppConfig::update(|c| {
+                    c.battery_profile_id = id;
+                });
+                let config = AppConfig::load();
+                self.send_power_auto_settings(&config);
+            }
             AppMsg::ActivateProfile(id) => {
-                crate::services::config::AppConfig::update(|c| c.active_profile_id = id.clone());
-                let config = crate::services::config::AppConfig::load();
+                let mut config = AppConfig::load();
+                if !config.profiles.iter().any(|p| p.id == id) {
+                    return;
+                }
+                if config.active_profile_id != id {
+                    config.active_profile_id = id;
+                    config.save();
+                }
                 self.distribute_profile(config.active_profile());
+                self.home.sender().emit(HomeMsg::RefreshProfiles);
+                self.sync_tray_state();
+            }
+            AppMsg::ProfilesChanged => {
+                let config = AppConfig::load();
+                self.power_auto_controls.sync_from_config(&config);
+                self.send_power_auto_settings(&config);
+                self.sync_tray_state();
+            }
+            AppMsg::SetFanProfileFromTray(profile) => {
+                self.fan.sender().emit(FanMsg::SetFromTray(profile));
+            }
+            AppMsg::ToggleBatteryMaintenanceFromTray => {
+                self.battery
+                    .sender()
+                    .emit(BatteryMsg::ToggleMaintenanceFromTray);
+            }
+            AppMsg::FanStateChanged {
+                profile,
+                asusd_available,
+            } => {
+                self.tray_fan_profile = profile;
+                self.tray_fan_available = asusd_available;
+                self.sync_tray_state();
+            }
+            AppMsg::BatteryStateChanged {
+                limit,
+                asusd_available,
+            } => {
+                self.tray_battery_limit = limit;
+                self.tray_battery_available = asusd_available;
+                self.sync_tray_state();
+            }
+            AppMsg::HardwareSupportUpdated { slot, supported } => {
+                match slot {
+                    SupportSlot::Aura => self.hardware_support.aura_supported = Some(supported),
+                    SupportSlot::Gpu => self.hardware_support.gpu_supported = Some(supported),
+                    SupportSlot::ApuMem => {
+                        self.hardware_support.apu_mem_supported = Some(supported)
+                    }
+                    SupportSlot::Numberpad => {
+                        self.hardware_support.numberpad_supported = Some(supported)
+                    }
+                }
+                self.apply_hardware_visibility();
             }
             AppMsg::LegacyMigrationAccepted => {
                 match crate::services::migration::perform_migration() {
@@ -352,27 +735,87 @@ impl SimpleComponent for AppModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let config = AppConfig::load();
         let home = HomeModel::builder()
             .launch(!init)
             .forward(sender.input_sender(), |msg| match msg {
                 HomeOutput::Error(e) => AppMsg::Error(e),
                 HomeOutput::ActivateProfile(id) => AppMsg::ActivateProfile(id),
+                HomeOutput::ProfilesChanged => AppMsg::ProfilesChanged,
             });
-        let apu_mem = launch_component!(ApuMemModel, sender);
+        let apu_mem = ApuMemModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                ApuMemOutput::Error(e) => AppMsg::Error(e),
+                ApuMemOutput::SupportDetected(supported) => AppMsg::HardwareSupportUpdated {
+                    slot: SupportSlot::ApuMem,
+                    supported,
+                },
+            });
         let armoury = launch_component!(ArmouryModel, sender);
-        let battery = launch_component!(BatteryModel, sender);
-        let fan = launch_component!(FanModel, sender);
-        let gpu = launch_component!(GpuModel, sender);
+        let battery = BatteryModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                BatteryOutput::Error(e) => AppMsg::Error(e),
+                BatteryOutput::ChargeLimitChanged {
+                    limit,
+                    asusd_available,
+                } => AppMsg::BatteryStateChanged {
+                    limit,
+                    asusd_available,
+                },
+            });
+        let diagnostics = DiagnosticsModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                DiagnosticsOutput::Toast(text) => AppMsg::Toast(text),
+            });
+        let fan = FanModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                FanOutput::Error(e) => AppMsg::Error(e),
+                FanOutput::StateChanged {
+                    profile,
+                    asusd_available,
+                } => AppMsg::FanStateChanged {
+                    profile,
+                    asusd_available,
+                },
+            });
+        let gpu = GpuModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                GpuOutput::Error(e) => AppMsg::Error(e),
+                GpuOutput::SupportDetected(supported) => AppMsg::HardwareSupportUpdated {
+                    slot: SupportSlot::Gpu,
+                    supported,
+                },
+            });
         let refresh_rate = launch_component!(RefreshRateModel, sender);
         let oled_dimming = launch_component!(OledDimmingModel, sender);
         let target_mode = launch_component!(TargetModeModel, sender);
         let oled_care = launch_component!(OledCareModel, sender);
         let color_gamut = launch_component!(ColorGamutModel, sender);
-        let aura = launch_component!(AuraPageModel, sender);
+        let aura = AuraPageModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                AuraPageOutput::Error(e) => AppMsg::Error(e),
+                AuraPageOutput::SupportDetected(supported) => AppMsg::HardwareSupportUpdated {
+                    slot: SupportSlot::Aura,
+                    supported,
+                },
+            });
         let animatrix = launch_component!(AnimatrixModel, sender);
         let fn_key = launch_component!(FnKeyModel, sender);
         let gestures = launch_component!(GesturesModel, sender);
-        let numberpad = launch_component!(NumberpadModel, sender);
+        let numberpad = NumberpadModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                NumberpadOutput::SupportDetected(supported) => AppMsg::HardwareSupportUpdated {
+                    slot: SupportSlot::Numberpad,
+                    supported,
+                },
+            });
         let touchpad = launch_component!(TouchpadModel, sender);
         let typing = launch_component!(TypingModel, sender);
         let auto_backlight = AutoBacklightModel::builder()
@@ -385,15 +828,35 @@ impl SimpleComponent for AppModel {
         let sound_modes = launch_component!(SoundModesModel, sender);
         let volume_widget = launch_component!(VolumeModel, sender);
 
+        let initial_fan_profile = FanProfile::from(config.active_profile().fan_profile);
+        let initial_tray_state = tray::TrayState {
+            profiles: config
+                .profiles
+                .iter()
+                .map(|p| tray::TrayProfileEntry {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    active: p.id == config.active_profile_id,
+                })
+                .collect(),
+            fan_profile: initial_fan_profile,
+            fan_available: false,
+            battery_limit: 80,
+            battery_available: false,
+        };
         let tray_svc = ksni::TrayService::new(tray::AyuzTray {
             app_sender: sender.input_sender().clone(),
+            state: initial_tray_state,
         });
         let tray_handle = tray_svc.handle();
         tray_svc.spawn();
 
+        let (power_auto_tx, power_auto_rx) =
+            tokio::sync::watch::channel(PowerAutoSettings::from(&config));
+        tokio::spawn(power_auto::run(sender.input_sender().clone(), power_auto_rx));
+
         let fan_sender = fan.sender().clone();
-        let initial_fan_hotkey_enabled =
-            crate::services::config::AppConfig::load().fan_hotkey_enabled;
+        let initial_fan_hotkey_enabled = config.fan_hotkey_enabled;
         let (fan_hotkey_tx, fan_hotkey_rx) =
             tokio::sync::watch::channel(initial_fan_hotkey_enabled);
         tokio::spawn(crate::services::fan_hotkey::run(fan_sender, fan_hotkey_rx));
@@ -436,16 +899,81 @@ impl SimpleComponent for AppModel {
         });
 
         let toast_overlay = adw::ToastOverlay::new();
+        let sidebar_list = gtk4::ListBox::new();
+        sidebar_list.add_css_class("navigation-sidebar");
+        sidebar_list.set_selection_mode(gtk4::SelectionMode::Single);
+
+        let sorted_nav = Rc::new(sorted_nav_items());
+        sidebar_list.set_header_func(|row, before| {
+            if before.is_some_and(|b| b.index() == 0) {
+                let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+                sep.set_margin_top(4);
+                sep.set_margin_bottom(4);
+                sep.add_css_class("nav-separator");
+                row.set_header(Some(&sep));
+            } else {
+                row.set_header(None::<&gtk4::Widget>);
+            }
+        });
+
+        let mut sidebar_rows = HashMap::new();
+        for (icon_name, title_key, page_name) in sorted_nav.iter() {
+            let row = gtk4::ListBoxRow::new();
+            let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+            hbox.set_margin_top(10);
+            hbox.set_margin_bottom(10);
+            hbox.set_margin_start(12);
+            hbox.set_margin_end(12);
+            let icon = gtk4::Image::from_icon_name(icon_name);
+            icon.set_pixel_size(16);
+            let label = gtk4::Label::new(Some(t!(*title_key).as_ref()));
+            label.set_halign(gtk4::Align::Start);
+            hbox.append(&icon);
+            hbox.append(&label);
+            row.set_child(Some(&hbox));
+            sidebar_list.append(&row);
+            sidebar_rows.insert(*page_name, row);
+        }
+
+        let content_stack = adw::ViewStack::new();
+        content_stack.set_transition_duration(250);
+        content_stack.set_enable_transitions(true);
+
+        let search_visibility = Rc::new(RefCell::new(SearchVisibility::default()));
+        let power_auto_controls = PowerAutoControls::new(&sender, &config);
+        let hardware_support = HardwareSupportState {
+            animatrix_supported: detect_animatrix_hardware() != AnimatrixHardwareType::Unsupported,
+            aura_supported: None,
+            gpu_supported: None,
+            apu_mem_supported: None,
+            numberpad_supported: None,
+            kde_available: is_kde_desktop(),
+            cosmic_available: is_cosmic_desktop(),
+            gnome_available: is_gnome_desktop(),
+        };
 
         let model = AppModel {
             start_hidden: init,
             window: root.downgrade(),
             toast_overlay,
-            _tray: tray_handle,
+            tray: tray_handle,
+            tray_fan_profile: initial_fan_profile,
+            tray_fan_available: false,
+            tray_battery_limit: 80,
+            tray_battery_available: false,
+            sidebar_list: sidebar_list.clone(),
+            sidebar_rows,
+            content_stack: content_stack.clone(),
+            search_visibility: search_visibility.clone(),
+            hide_unsupported_hardware: config.hide_unsupported_hardware,
+            hardware_support,
+            power_auto_tx,
+            power_auto_controls,
             home,
             apu_mem,
             armoury,
             battery,
+            diagnostics,
             fan,
             gpu,
             refresh_rate,
@@ -470,6 +998,7 @@ impl SimpleComponent for AppModel {
         let apu_mem_widget = model.apu_mem.widget();
         let armoury_widget = model.armoury.widget();
         let battery_widget = model.battery.widget();
+        let diagnostics_widget = model.diagnostics.widget();
         let fan_widget = model.fan.widget();
         let gpu_widget = model.gpu.widget();
         let refresh_rate_widget = model.refresh_rate.widget();
@@ -548,9 +1077,11 @@ impl SimpleComponent for AppModel {
         system_page.add(gpu_widget);
         system_page.add(apu_mem_widget);
         system_page.add(armoury_widget);
+        system_page.add(diagnostics_widget);
 
         let lang_group = build_language_and_autostart_group(&sender);
         system_page.add(&lang_group);
+        system_page.add(&model.power_auto_controls.group);
 
         let legacy_group = build_legacy_migration_group(&sender);
         system_page.add(&legacy_group);
@@ -602,6 +1133,10 @@ impl SimpleComponent for AppModel {
             ("apu_mem", apu_mem_widget.clone().upcast::<gtk4::Widget>()),
             ("armoury", armoury_widget.clone().upcast::<gtk4::Widget>()),
             ("battery", battery_widget.clone().upcast::<gtk4::Widget>()),
+            (
+                "diagnostics",
+                diagnostics_widget.clone().upcast::<gtk4::Widget>(),
+            ),
             ("fan", fan_widget.clone().upcast::<gtk4::Widget>()),
             (
                 "asus_key_hint",
@@ -609,6 +1144,14 @@ impl SimpleComponent for AppModel {
             ),
             ("gpu", gpu_widget.clone().upcast::<gtk4::Widget>()),
             ("lang", lang_group.clone().upcast::<gtk4::Widget>()),
+            (
+                "power_auto",
+                model
+                    .power_auto_controls
+                    .group
+                    .clone()
+                    .upcast::<gtk4::Widget>(),
+            ),
         ]);
 
         // ViewStack for the content area
@@ -617,9 +1160,6 @@ impl SimpleComponent for AppModel {
         home_scroll.set_child(Some(home_widget));
         home_scroll.set_vexpand(true);
 
-        let content_stack = adw::ViewStack::new();
-        content_stack.set_transition_duration(250);
-        content_stack.set_enable_transitions(true);
         content_stack.add_named(&home_scroll, Some(AppPage::Home.as_str()));
         content_stack.add_named(&display_page, Some(AppPage::Display.as_str()));
         content_stack.add_named(&keyboard_page, Some(AppPage::Keyboard.as_str()));
@@ -636,6 +1176,7 @@ impl SimpleComponent for AppModel {
         let battery_sender = model.battery.sender().clone();
         let fan_telemetry_sender = model.fan.sender().clone();
         let armoury_sender = model.armoury.sender().clone();
+        let diagnostics_sender = model.diagnostics.sender().clone();
         content_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
             match stack.visible_child_name().as_deref() {
                 Some(name) if name == AppPage::Audio.as_str() => {
@@ -649,6 +1190,7 @@ impl SimpleComponent for AppModel {
                     battery_sender.emit(BatteryMsg::RefreshStats);
                     fan_telemetry_sender.emit(FanMsg::RefreshTelemetry);
                     armoury_sender.emit(ArmouryMsg::Refresh);
+                    diagnostics_sender.emit(DiagnosticsMsg::Refresh);
                 }
                 _ => {}
             }
@@ -660,42 +1202,7 @@ impl SimpleComponent for AppModel {
         content_toolbar.set_content(Some(&content_stack));
         let content_nav_page = adw::NavigationPage::new(&content_toolbar, &t!("tab_display"));
 
-        // Sidebar
-
-        let sidebar_list = gtk4::ListBox::new();
-        sidebar_list.add_css_class("navigation-sidebar");
-        sidebar_list.set_selection_mode(gtk4::SelectionMode::Single);
-
-        let sorted_nav = Rc::new(sorted_nav_items());
-
-        sidebar_list.set_header_func(|row, _before| {
-            if row.index() == 1 {
-                let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-                sep.set_margin_top(4);
-                sep.set_margin_bottom(4);
-                sep.add_css_class("nav-separator");
-                row.set_header(Some(&sep));
-            } else {
-                row.set_header(None::<&gtk4::Widget>);
-            }
-        });
-
-        for (icon_name, title_key, _page_name) in sorted_nav.iter() {
-            let row = gtk4::ListBoxRow::new();
-            let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-            hbox.set_margin_top(10);
-            hbox.set_margin_bottom(10);
-            hbox.set_margin_start(12);
-            hbox.set_margin_end(12);
-            let icon = gtk4::Image::from_icon_name(icon_name);
-            icon.set_pixel_size(16);
-            let label = gtk4::Label::new(Some(t!(*title_key).as_ref()));
-            label.set_halign(gtk4::Align::Start);
-            hbox.append(&icon);
-            hbox.append(&label);
-            row.set_child(Some(&hbox));
-            sidebar_list.append(&row);
-        }
+        // Sidebar wiring
 
         let stack_c = content_stack.clone();
         let nav_page_c = content_nav_page.clone();
@@ -722,6 +1229,7 @@ impl SimpleComponent for AppModel {
             &content_nav_page,
             &sidebar_list,
             widget_map,
+            search_visibility,
         );
         content_stack.add_named(&search_widgets.scroll, Some(AppPage::Search.as_str()));
 
@@ -789,6 +1297,7 @@ impl SimpleComponent for AppModel {
         // Build widget tree
 
         let widgets = view_output!();
+        model.apply_hardware_visibility();
 
         root.set_hide_on_close(true);
 
@@ -932,7 +1441,8 @@ fn build_language_and_autostart_group(
     let lang_dropdown = gtk4::DropDown::from_strings(&display_names);
     lang_dropdown.set_valign(gtk4::Align::Center);
 
-    let current_lang = crate::services::config::AppConfig::load().language;
+    let cfg = AppConfig::load();
+    let current_lang = cfg.language;
     if let Some(idx) = SUPPORTED_LANGS
         .iter()
         .position(|(_, code)| *code == current_lang)
@@ -960,6 +1470,16 @@ fn build_language_and_autostart_group(
         sender_at.input(AppMsg::ToggleAutostart(row.is_active()));
     });
     group.add(&autostart_row);
+
+    let hide_unsupported_row = adw::SwitchRow::new();
+    hide_unsupported_row.set_title(&t!("hide_unsupported_title"));
+    hide_unsupported_row.set_subtitle(&t!("hide_unsupported_subtitle"));
+    hide_unsupported_row.set_active(cfg.hide_unsupported_hardware);
+    let sender_hide = sender.clone();
+    hide_unsupported_row.connect_active_notify(move |row| {
+        sender_hide.input(AppMsg::ToggleHideUnsupported(row.is_active()));
+    });
+    group.add(&hide_unsupported_row);
 
     group
 }

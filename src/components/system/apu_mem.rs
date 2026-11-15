@@ -48,6 +48,12 @@ pub struct ApuMemModel {
 
 /// Input messages for the APU memory component.
 #[derive(Debug)]
+pub enum ApuMemOutput {
+    Error(String),
+    SupportDetected(bool),
+}
+
+#[derive(Debug)]
 pub enum ApuMemMsg {
     /// User selected index `idx` in the memory size dropdown.
     ChangeValue(u32),
@@ -72,7 +78,7 @@ pub enum ApuMemCommandOutput {
 impl Component for ApuMemModel {
     type Init = ();
     type Input = ApuMemMsg;
-    type Output = String;
+    type Output = ApuMemOutput;
     type CommandOutput = ApuMemCommandOutput;
 
     view! {
@@ -217,10 +223,12 @@ impl Component for ApuMemModel {
     ) {
         match msg {
             ApuMemCommandOutput::NotAvailable => {
-                // available stays false; group is visible but combo row is disabled
+                // available stays false; group is visible (unless hidden) with combo row disabled
+                let _ = sender.output(ApuMemOutput::SupportDetected(false));
             }
             ApuMemCommandOutput::Init(options, current) => {
                 self.available = true;
+                let _ = sender.output(ApuMemOutput::SupportDetected(true));
                 self.display_options = options;
                 self.current_value = current;
 
@@ -240,7 +248,7 @@ impl Component for ApuMemModel {
                 tracing::info!("{}", t!("apu_mem_set", value = label_for_value(v)));
             }
             ApuMemCommandOutput::Error(e) => {
-                let _ = sender.output(e);
+                let _ = sender.output(ApuMemOutput::Error(e));
             }
         }
     }

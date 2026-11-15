@@ -15,13 +15,45 @@
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
 use crate::app::AppMsg;
-use ksni::menu::StandardItem;
+use crate::services::dbus::FanProfile;
+use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, Tray};
 use relm4::Sender;
 use rust_i18n::t;
 
+/// Profile item rendered in the tray's Profiles submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayProfileEntry {
+    pub id: String,
+    pub name: String,
+    pub active: bool,
+}
+
+/// Live state synchronized into the system tray menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayState {
+    pub profiles: Vec<TrayProfileEntry>,
+    pub fan_profile: FanProfile,
+    pub fan_available: bool,
+    pub battery_limit: u8,
+    pub battery_available: bool,
+}
+
+impl Default for TrayState {
+    fn default() -> Self {
+        Self {
+            profiles: Vec::new(),
+            fan_profile: FanProfile::Balanced,
+            fan_available: false,
+            battery_limit: 80,
+            battery_available: false,
+        }
+    }
+}
+
 pub struct AyuzTray {
     pub app_sender: Sender<AppMsg>,
+    pub state: TrayState,
 }
 
 impl Tray for AyuzTray {
@@ -33,36 +65,115 @@ impl Tray for AyuzTray {
         "Ayuz".into()
     }
 
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.app_sender.emit(AppMsg::ShowWindow);
+    }
+
     fn icon_pixmap(&self) -> Vec<Icon> {
-        let png_bytes = include_bytes!("../assets/trayicon.png");
-        let Ok(img) = image::load_from_memory(png_bytes) else {
-            return vec![];
+        let icon_bytes = include_bytes!("../assets/trayicon.png");
+        let Ok(img) = image::load_from_memory(icon_bytes) else {
+            return Vec::new();
         };
-        let img = img.into_rgba8();
-        let (width, height) = img.dimensions();
-        let data: Vec<u8> = img
-            .pixels()
-            .flat_map(|p| [p[3], p[0], p[1], p[2]])
-            .collect();
+        let rgba = img.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut argb = rgba.into_raw();
+        for px in argb.chunks_exact_mut(4) {
+            px.rotate_right(1);
+        }
         vec![Icon {
             width: width as i32,
             height: height as i32,
-            data,
+            data: argb,
         }]
-    }
-
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.app_sender.emit(AppMsg::ShowWindow);
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let sender_show = self.app_sender.clone();
         let sender_quit = self.app_sender.clone();
+
+        let profile_items: Vec<MenuItem<Self>> = self
+            .state
+            .profiles
+            .iter()
+            .map(|entry| {
+                let sender = self.app_sender.clone();
+                let id = entry.id.clone();
+                MenuItem::Checkmark(CheckmarkItem {
+                    label: entry.name.clone(),
+                    checked: entry.active,
+                    activate: Box::new(move |_| {
+                        sender.emit(AppMsg::ActivateProfile(id.clone()));
+                    }),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        let fan_modes = [
+            (
+                t!("fan_performance_title").to_string(),
+                FanProfile::Performance,
+                self.state.fan_profile == FanProfile::Performance,
+            ),
+            (
+                t!("fan_balanced_title").to_string(),
+                FanProfile::Balanced,
+                self.state.fan_profile == FanProfile::Balanced,
+            ),
+            (
+                t!("fan_quiet_title").to_string(),
+                FanProfile::Quiet,
+                matches!(
+                    self.state.fan_profile,
+                    FanProfile::Quiet | FanProfile::LowPower
+                ),
+            ),
+        ];
+
+        let fan_items: Vec<MenuItem<Self>> = fan_modes
+            .into_iter()
+            .map(|(label, profile, checked)| {
+                let sender = self.app_sender.clone();
+                MenuItem::Checkmark(CheckmarkItem {
+                    label,
+                    checked,
+                    enabled: self.state.fan_available,
+                    activate: Box::new(move |_| {
+                        sender.emit(AppMsg::SetFanProfileFromTray(profile));
+                    }),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        let sender_battery = self.app_sender.clone();
+
         vec![
             MenuItem::Standard(StandardItem {
                 label: t!("tray_show").to_string(),
                 activate: Box::new(move |_| {
                     sender_show.emit(AppMsg::ShowWindow);
+                }),
+                ..Default::default()
+            }),
+            MenuItem::Separator,
+            MenuItem::SubMenu(SubMenu {
+                label: t!("tray_profiles").to_string(),
+                enabled: !profile_items.is_empty(),
+                submenu: profile_items,
+                ..Default::default()
+            }),
+            MenuItem::SubMenu(SubMenu {
+                label: t!("tray_fan_mode").to_string(),
+                submenu: fan_items,
+                ..Default::default()
+            }),
+            MenuItem::Checkmark(CheckmarkItem {
+                label: t!("tray_battery_maintenance").to_string(),
+                checked: self.state.battery_limit <= 80,
+                enabled: self.state.battery_available,
+                activate: Box::new(move |_| {
+                    sender_battery.emit(AppMsg::ToggleBatteryMaintenanceFromTray);
                 }),
                 ..Default::default()
             }),

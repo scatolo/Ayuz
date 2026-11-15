@@ -53,6 +53,12 @@ pub enum AuraPageMsg {
 }
 
 #[derive(Debug)]
+pub enum AuraPageOutput {
+    Error(String),
+    SupportDetected(bool),
+}
+
+#[derive(Debug)]
 pub enum AuraPageCmd {
     Discovered {
         daemon_running: bool,
@@ -64,7 +70,7 @@ pub enum AuraPageCmd {
 impl Component for AuraPageModel {
     type Init = ();
     type Input = AuraPageMsg;
-    type Output = String;
+    type Output = AuraPageOutput;
     type CommandOutput = AuraPageCmd;
     type Root = gtk::Box;
     type Widgets = ();
@@ -189,6 +195,9 @@ impl Component for AuraPageModel {
                 daemon_running,
                 devices,
             } => {
+                let supported = !(daemon_running && devices.is_empty());
+                let _ = sender.output(AuraPageOutput::SupportDetected(supported));
+
                 self.daemon_label.set_visible(!daemon_running);
                 self.no_devices_label
                     .set_visible(daemon_running && devices.is_empty());
@@ -208,7 +217,7 @@ impl Component for AuraPageModel {
                 }
             }
             AuraPageCmd::DiscoveryError(e) => {
-                let _ = sender.output(e);
+                let _ = sender.output(AuraPageOutput::Error(e));
                 self.daemon_label.set_visible(false);
                 self.no_devices_label.set_visible(true);
                 self.status_group.set_visible(true);

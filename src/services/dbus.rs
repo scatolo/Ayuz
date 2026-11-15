@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use futures_util::StreamExt;
 use rust_i18n::t;
 
 // ── D-Bus identifiers ────────────────────────────────────────────────────────
@@ -168,6 +169,24 @@ pub(crate) fn power_profile_name(profile: FanProfile) -> &'static str {
     }
 }
 
+/// Maps an `org.freedesktop.UPower.PowerProfiles` `ActiveProfile` string back to [`FanProfile`].
+pub fn fan_profile_from_power_profile_name(name: &str) -> Option<FanProfile> {
+    match name.trim() {
+        "balanced" => Some(FanProfile::Balanced),
+        "performance" => Some(FanProfile::Performance),
+        "power-saver" => Some(FanProfile::Quiet),
+        _ => None,
+    }
+}
+
+/// Returns `true` when two [`FanProfile`] variants represent the same user-facing mode
+/// (`Quiet` and `LowPower` are treated as equivalent).
+pub fn is_equivalent_fan_profile(a: FanProfile, b: FanProfile) -> bool {
+    a == b
+        || (matches!(a, FanProfile::Quiet | FanProfile::LowPower)
+            && matches!(b, FanProfile::Quiet | FanProfile::LowPower))
+}
+
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.PowerProfiles",
     default_service = "org.freedesktop.UPower.PowerProfiles",
@@ -192,6 +211,13 @@ static POWER_PROFILE_SYNC_LOCK: tokio::sync::Mutex<()> =
 pub fn spawn_sync_power_profile(profile: FanProfile) {
     let seq = POWER_PROFILE_SYNC_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     tokio::spawn(sync_power_profile_seq(profile, seq));
+}
+
+/// Awaits an ordered sync of `org.freedesktop.UPower.PowerProfiles` (`ActiveProfile`)
+/// to match `profile`. Used at startup before subscribing to external property changes.
+pub async fn sync_power_profile_now(profile: FanProfile) {
+    let seq = POWER_PROFILE_SYNC_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    sync_power_profile_seq(profile, seq).await;
 }
 
 async fn sync_power_profile_seq(profile: FanProfile, seq: u64) {
@@ -228,6 +254,27 @@ async fn sync_power_profile_seq(profile: FanProfile, seq: u64) {
     }
 }
 
+async fn write_platform_profile_to_asusd(profile: FanProfile) -> Result<FanProfile, String> {
+    let proxy = platform_proxy().await?;
+    match proxy.set_platform_profile(profile as u32).await {
+        Ok(_) => Ok(profile),
+        Err(e) if profile == FanProfile::Quiet && e.to_string().contains("NotSupported") => proxy
+            .set_platform_profile(FanProfile::LowPower as u32)
+            .await
+            .map(|_| FanProfile::LowPower)
+            .map_err(|e2| t!("error_fan_profile_write", error = e2.to_string()).to_string()),
+        Err(e) => Err(t!("error_fan_profile_write", error = e.to_string()).to_string()),
+    }
+}
+
+/// Applies a fan/platform profile to `asusd` without re-syncing `UPower.PowerProfiles`.
+///
+/// Used when reacting to an external `UPower.PowerProfiles` change (e.g. GNOME Quick Settings)
+/// so `asusd` stays aligned without bouncing a D-Bus write back to `PowerProfiles`.
+pub async fn set_platform_profile_only(profile: FanProfile) -> Result<FanProfile, String> {
+    write_platform_profile_to_asusd(profile).await
+}
+
 /// Applies a fan/platform profile via `asusd` and returns the applied profile on success.
 ///
 /// If the requested profile is [`FanProfile::Quiet`] and the daemon returns a
@@ -238,18 +285,90 @@ async fn sync_power_profile_seq(profile: FanProfile, seq: u64) {
 /// Also triggers a best-effort background sync of `org.freedesktop.UPower.PowerProfiles`
 /// so desktop power-mode indicators (e.g. GNOME Quick Settings) stay aligned.
 pub async fn set_fan_profile(profile: FanProfile) -> Result<FanProfile, String> {
-    let proxy = platform_proxy().await?;
-    let applied = match proxy.set_platform_profile(profile as u32).await {
-        Ok(_) => profile,
-        Err(e) if profile == FanProfile::Quiet && e.to_string().contains("NotSupported") => proxy
-            .set_platform_profile(FanProfile::LowPower as u32)
-            .await
-            .map(|_| FanProfile::LowPower)
-            .map_err(|e2| t!("error_fan_profile_write", error = e2.to_string()).to_string())?,
-        Err(e) => return Err(t!("error_fan_profile_write", error = e.to_string()).to_string()),
-    };
+    let applied = write_platform_profile_to_asusd(profile).await?;
     spawn_sync_power_profile(applied);
     Ok(applied)
+}
+
+/// Origin of an externally observed fan/power profile change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalProfileSource {
+    Asusd,
+    PowerProfiles,
+}
+
+/// Watches both `xyz.ljones.Platform.platform_profile` (`asusctl`) and
+/// `org.freedesktop.UPower.PowerProfiles.ActiveProfile` (GNOME Quick Settings / KDE)
+/// for external changes and forwards them over `tx`.
+pub async fn watch_external_fan_profile_changes(
+    tx: tokio::sync::mpsc::UnboundedSender<(ExternalProfileSource, FanProfile)>,
+) {
+    let Ok(conn) = system_bus_connection().await else {
+        return;
+    };
+    let Ok(platform) = PlatformProxy::new(&conn).await else {
+        return;
+    };
+    let ppd = PowerProfilesProxy::new(&conn).await.ok();
+
+    let mut last_asusd = platform
+        .platform_profile()
+        .await
+        .ok()
+        .map(FanProfile::from);
+    let mut last_ppd = match &ppd {
+        Some(p) => p.active_profile().await.ok(),
+        None => None,
+    };
+
+    let asusd_stream = platform.receive_platform_profile_changed().await;
+    tokio::pin!(asusd_stream);
+    let mut ppd_stream = match &ppd {
+        Some(p) => Some(p.receive_active_profile_changed().await),
+        None => None,
+    };
+
+    loop {
+        tokio::select! {
+            maybe = asusd_stream.next() => {
+                let Some(changed) = maybe else {
+                    break;
+                };
+                if let Ok(raw) = changed.get().await {
+                    let profile = FanProfile::from(raw);
+                    if last_asusd == Some(profile) {
+                        continue;
+                    }
+                    last_asusd = Some(profile);
+                    if tx.send((ExternalProfileSource::Asusd, profile)).is_err() {
+                        break;
+                    }
+                }
+            }
+            maybe = async {
+                match ppd_stream.as_mut() {
+                    Some(s) => s.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(changed) = maybe {
+                    if let Ok(name) = changed.get().await {
+                        if last_ppd.as_deref() == Some(name.as_str()) {
+                            continue;
+                        }
+                        last_ppd = Some(name.clone());
+                        if let Some(profile) = fan_profile_from_power_profile_name(&name)
+                            && tx.send((ExternalProfileSource::PowerProfiles, profile)).is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    ppd_stream = None;
+                }
+            }
+        }
+    }
 }
 
 #[zbus::proxy(
@@ -1083,6 +1202,43 @@ mod tests {
         assert_eq!(power_profile_name(FanProfile::Performance), "performance");
         assert_eq!(power_profile_name(FanProfile::Quiet), "power-saver");
         assert_eq!(power_profile_name(FanProfile::LowPower), "power-saver");
+    }
+
+    #[test]
+    fn test_fan_profile_from_power_profile_name() {
+        assert_eq!(
+            fan_profile_from_power_profile_name("balanced"),
+            Some(FanProfile::Balanced)
+        );
+        assert_eq!(
+            fan_profile_from_power_profile_name("performance"),
+            Some(FanProfile::Performance)
+        );
+        assert_eq!(
+            fan_profile_from_power_profile_name("power-saver\n"),
+            Some(FanProfile::Quiet)
+        );
+        assert_eq!(fan_profile_from_power_profile_name("unknown"), None);
+    }
+
+    #[test]
+    fn test_is_equivalent_fan_profile() {
+        assert!(is_equivalent_fan_profile(
+            FanProfile::Quiet,
+            FanProfile::LowPower
+        ));
+        assert!(is_equivalent_fan_profile(
+            FanProfile::LowPower,
+            FanProfile::Quiet
+        ));
+        assert!(is_equivalent_fan_profile(
+            FanProfile::Balanced,
+            FanProfile::Balanced
+        ));
+        assert!(!is_equivalent_fan_profile(
+            FanProfile::Balanced,
+            FanProfile::Performance
+        ));
     }
 
     #[test]

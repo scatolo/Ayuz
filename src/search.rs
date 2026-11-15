@@ -17,8 +17,28 @@
 use relm4::adw;
 use relm4::adw::prelude::*;
 use rust_i18n::t;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+/// Tracks pages, component keys, and individual row title keys currently hidden because
+/// hardware/DE support is absent and the user enabled `hide_unsupported_hardware`.
+#[derive(Debug, Default, Clone)]
+pub struct SearchVisibility {
+    pub hidden_pages: HashSet<&'static str>,
+    pub hidden_components: HashSet<&'static str>,
+    pub hidden_title_keys: HashSet<&'static str>,
+}
+
+impl SearchVisibility {
+    pub fn is_visible(&self, page_name: &str, component_key: &str) -> bool {
+        !self.hidden_pages.contains(page_name) && !self.hidden_components.contains(component_key)
+    }
+
+    pub fn is_item_visible(&self, page_name: &str, component_key: &str, title_key: &str) -> bool {
+        self.is_visible(page_name, component_key) && !self.hidden_title_keys.contains(title_key)
+    }
+}
 
 const SCROLL_ANIMATION_DELAY_MS: u64 = 150;
 
@@ -422,6 +442,27 @@ static SEARCH_INDEX: &[SearchItem] = &[
         page_name: "system",
         component_key: "armoury",
     },
+    SearchItem {
+        title_key: "power_auto_group_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "power_auto",
+    },
+    SearchItem {
+        title_key: "diagnostics_group_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "diagnostics",
+    },
+    SearchItem {
+        title_key: "hide_unsupported_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "lang",
+    },
 ];
 
 pub struct SearchWidgets {
@@ -468,6 +509,7 @@ pub fn setup(
     content_nav_page: &adw::NavigationPage,
     sidebar_list: &gtk4::ListBox,
     widget_map: HashMap<&'static str, gtk4::Widget>,
+    visibility: Rc<RefCell<SearchVisibility>>,
 ) -> SearchWidgets {
     let widget_map = Rc::new(widget_map);
     let sorted_items = Rc::new(sorted_items);
@@ -534,6 +576,7 @@ pub fn setup(
     let sidebar_list_c = sidebar_list.clone();
     let widget_map_c = widget_map.clone();
     let sorted_items_c = sorted_items.clone();
+    let visibility_c = visibility;
     search_entry.connect_search_changed(move |entry| {
         let text = entry.text().to_lowercase();
         results_list_c.remove_all();
@@ -542,8 +585,12 @@ pub fn setup(
             return;
         }
 
+        let vis = visibility_c.borrow();
         let mut found = false;
         for item in SEARCH_INDEX {
+            if !vis.is_item_visible(item.page_name, item.component_key, item.title_key) {
+                continue;
+            }
             let title = t!(item.title_key);
             if title.to_lowercase().contains(&text) {
                 found = true;
@@ -592,5 +639,29 @@ pub fn setup(
         scroll: search_scroll,
         bar: search_bar,
         toggle: search_toggle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_search_visibility_filters_pages_and_components() {
+        let mut vis = SearchVisibility::default();
+        assert!(vis.is_visible("animatrix", "animatrix"));
+        assert!(vis.is_visible("display", "oled_dimming"));
+
+        vis.hidden_pages.insert("animatrix");
+        vis.hidden_components.insert("oled_dimming");
+        vis.hidden_title_keys.insert("oled_care_pixel_refresh_title");
+
+        assert!(!vis.is_visible("animatrix", "animatrix"));
+        assert!(!vis.is_visible("animatrix", "anything"));
+        assert!(!vis.is_visible("display", "oled_dimming"));
+        assert!(vis.is_visible("display", "oled_care"));
+        assert!(!vis.is_item_visible("display", "oled_care", "oled_care_pixel_refresh_title"));
+        assert!(vis.is_item_visible("display", "oled_care", "oled_care_screen_blank_title"));
+        assert!(vis.is_visible("system", "diagnostics"));
     }
 }

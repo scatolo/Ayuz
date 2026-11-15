@@ -32,7 +32,9 @@ pub const SYS_CPU_GOVERNOR: &str = "/sys/devices/system/cpu/cpufreq/policy0/scal
 pub const SYS_INTEL_NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
 pub const SYS_ASUS_ARMOURY_ATTRS_DIR: &str =
     "/sys/class/firmware-attributes/asus-armoury/attributes";
+pub const SYS_DRM_DIR: &str = "/sys/class/drm";
 pub const DEV_UINPUT: &str = "/dev/uinput";
+pub const DEV_INPUT_DIR: &str = "/dev/input";
 pub const PROC_BUS_INPUT_DEVICES: &str = "/proc/bus/input/devices";
 
 /// Resolves the directory where AniMatrix GIF assets are stored.
@@ -426,6 +428,115 @@ pub fn is_armoury_attr_writable_in(base_dir: &Path, attr_name: &str) -> bool {
     std::fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o200 != 0)
         .unwrap_or(false)
+}
+
+/// Checks `/sys/class/drm/card*/device/vendor` to detect whether a discrete GPU
+/// (NVIDIA `0x10de` or multiple PCI GPU cards) is present.
+///
+/// Returns `Some(false)` when only a single integrated GPU is detected (e.g. Intel
+/// `0x8086` on UX3405CA), `Some(true)` if a discrete/secondary GPU is found, and
+/// `None` if `/sys/class/drm` exposes no readable card vendor entries.
+pub fn has_discrete_gpu() -> Option<bool> {
+    has_discrete_gpu_in(Path::new(SYS_DRM_DIR))
+}
+
+/// Path-parameterized version of [`has_discrete_gpu`] for unit testing.
+pub fn has_discrete_gpu_in(drm_dir: &Path) -> Option<bool> {
+    let entries = std::fs::read_dir(drm_dir).ok()?;
+    let mut vendors = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("card") || name_str.contains('-') {
+            continue;
+        }
+        if let Some(vendor) = read_trimmed(&entry.path().join("device").join("vendor")) {
+            vendors.push(vendor.to_ascii_lowercase());
+        }
+    }
+
+    if vendors.is_empty() {
+        return None;
+    }
+    if vendors.iter().any(|v| v == "0x10de") || vendors.len() >= 2 {
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
+/// Checks whether a whitespace-delimited group list (e.g. `id -Gn`) contains `target`.
+pub fn parse_groups_contains(raw_groups: &str, target: &str) -> bool {
+    raw_groups.split_whitespace().any(|g| g == target)
+}
+
+/// Returns `true` if the current process belongs to the `input` group.
+pub fn has_input_group() -> bool {
+    std::process::Command::new("id")
+        .arg("-Gn")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_groups_contains(&String::from_utf8_lossy(&o.stdout), "input"))
+        .unwrap_or(false)
+}
+
+/// Returns `true` if at least one `/dev/input/event*` node is readable by this process.
+pub fn can_read_any_input_event() -> bool {
+    can_read_any_input_event_in(Path::new(DEV_INPUT_DIR))
+}
+
+/// Path-parameterized version of [`can_read_any_input_event`] for unit testing.
+pub fn can_read_any_input_event_in(input_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(input_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("event") {
+            continue;
+        }
+        if std::fs::File::open(entry.path()).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` if `path` exists and can be opened for writing without blocking.
+pub fn is_path_writable(path: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .is_ok()
+}
+
+/// Formats an OS-appropriate package install command based on `/etc/os-release`.
+pub fn package_install_command(pkg_fedora: &str, pkg_debian: &str, pkg_arch: &str) -> String {
+    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    package_install_command_from_os_release(&os_release, pkg_fedora, pkg_debian, pkg_arch)
+}
+
+/// Pure helper to format an install command from `/etc/os-release` contents.
+pub fn package_install_command_from_os_release(
+    os_release: &str,
+    pkg_fedora: &str,
+    pkg_debian: &str,
+    pkg_arch: &str,
+) -> String {
+    let lower = os_release.to_ascii_lowercase();
+    if lower.contains("fedora") || lower.contains("rhel") || lower.contains("centos") {
+        format!("sudo dnf install -y {pkg_fedora}")
+    } else if lower.contains("ubuntu") || lower.contains("debian") || lower.contains("pop") {
+        format!("sudo apt install -y {pkg_debian}")
+    } else if lower.contains("arch") || lower.contains("cachyos") || lower.contains("manjaro") {
+        format!("sudo pacman -S {pkg_arch}")
+    } else {
+        format!("sudo dnf install -y {pkg_fedora}")
+    }
 }
 
 #[cfg(test)]
@@ -947,5 +1058,65 @@ cpu1 71 0 89 118089 151 12 2 0 0 0
         assert!(!is_armoury_attr_writable_in(&mock.path, "charge_mode"));
         assert!(is_armoury_attr_writable_in(&mock.path, "boot_sound"));
         assert!(!is_armoury_attr_writable_in(&mock.path, "nonexistent"));
+    }
+
+    #[test]
+    fn test_has_discrete_gpu_in() {
+        let mock = TempMockDir::new("drm_igpu");
+        let card1 = mock.path.join("card1").join("device");
+        let conn = mock.path.join("card1-eDP-1");
+        fs::create_dir_all(&card1).unwrap();
+        fs::create_dir_all(&conn).unwrap();
+        fs::write(card1.join("vendor"), "0x8086\n").unwrap();
+        assert_eq!(has_discrete_gpu_in(&mock.path), Some(false));
+
+        let card0 = mock.path.join("card0").join("device");
+        fs::create_dir_all(&card0).unwrap();
+        fs::write(card0.join("vendor"), "0x10de\n").unwrap();
+        assert_eq!(has_discrete_gpu_in(&mock.path), Some(true));
+
+        let empty = TempMockDir::new("drm_empty");
+        assert_eq!(has_discrete_gpu_in(&empty.path), None);
+    }
+
+    #[test]
+    fn test_parse_groups_contains() {
+        assert!(parse_groups_contains("thoma wheel input video", "input"));
+        assert!(!parse_groups_contains("thoma wheel video", "input"));
+        assert!(!parse_groups_contains("thoma input-extra", "input"));
+        assert!(!parse_groups_contains("", "input"));
+    }
+
+    #[test]
+    fn test_can_read_any_input_event_in() {
+        let mock = TempMockDir::new("input_ev");
+        assert!(!can_read_any_input_event_in(&mock.path));
+
+        fs::write(mock.path.join("mice"), "").unwrap();
+        assert!(!can_read_any_input_event_in(&mock.path));
+
+        fs::write(mock.path.join("event0"), "").unwrap();
+        assert!(can_read_any_input_event_in(&mock.path));
+    }
+
+    #[test]
+    fn test_package_install_command_from_os_release() {
+        assert_eq!(
+            package_install_command_from_os_release("ID=fedora\n", "playerctl", "playerctl", "playerctl"),
+            "sudo dnf install -y playerctl"
+        );
+        assert_eq!(
+            package_install_command_from_os_release(
+                "ID=ubuntu\nID_LIKE=debian\n",
+                "playerctl",
+                "playerctl",
+                "playerctl"
+            ),
+            "sudo apt install -y playerctl"
+        );
+        assert_eq!(
+            package_install_command_from_os_release("ID=arch\n", "playerctl", "playerctl", "playerctl"),
+            "sudo pacman -S playerctl"
+        );
     }
 }

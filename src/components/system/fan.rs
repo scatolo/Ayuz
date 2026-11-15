@@ -88,8 +88,20 @@ pub enum FanMsg {
     LoadProfile(FanProfile),
     /// Cycle to the next profile (triggered by the FN+F global hotkey).
     CycleFromHotkey,
+    /// Apply a fan profile selected from the system tray menu.
+    SetFromTray(FanProfile),
     /// Refresh read-only CPU EPP / Turbo telemetry from sysfs.
     RefreshTelemetry,
+}
+
+/// Output events emitted by [`FanModel`] to the parent [`AppModel`].
+#[derive(Debug)]
+pub enum FanOutput {
+    Error(String),
+    StateChanged {
+        profile: FanProfile,
+        asusd_available: bool,
+    },
 }
 
 /// Async command results for the fan profile component.
@@ -101,17 +113,55 @@ pub enum FanCommandOutput {
     InitialProfile(FanProfile),
     /// Confirmation that the profile was successfully applied.
     ProfileSet(FanProfile),
+    /// External change observed via `xyz.ljones.Platform` or `UPower.PowerProfiles`.
+    ExternalProfileChanged {
+        source: dbus::ExternalProfileSource,
+        profile: FanProfile,
+    },
     /// Read-only CPU EPP / Turbo telemetry snapshot.
     CpuTelemetryRead(CpuPowerTelemetry),
     /// An error message to forward as a toast notification.
     Error(String),
 }
 
+impl FanModel {
+    fn sync_radio_buttons(&self, profile: FanProfile) {
+        self.check_performance
+            .set_active(profile == FanProfile::Performance);
+        self.check_balanced
+            .set_active(profile == FanProfile::Balanced);
+        self.check_quiet
+            .set_active(profile == FanProfile::Quiet || profile == FanProfile::LowPower);
+    }
+
+    fn emit_state(&self, sender: &ComponentSender<Self>) {
+        let _ = sender.output(FanOutput::StateChanged {
+            profile: self.current_profile,
+            asusd_available: self.asusd_available,
+        });
+    }
+
+    fn spawn_refresh_cpu_telemetry(&self, sender: &ComponentSender<Self>) {
+        sender.command(|out, shutdown| {
+            shutdown
+                .register(async move {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    if let Ok(tel) =
+                        tokio::task::spawn_blocking(read_cpu_power_telemetry).await
+                    {
+                        out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                    }
+                })
+                .drop_on_shutdown()
+        });
+    }
+}
+
 #[relm4::component(pub)]
 impl Component for FanModel {
     type Init = ();
     type Input = FanMsg;
-    type Output = String;
+    type Output = FanOutput;
     type CommandOutput = FanCommandOutput;
 
     view! {
@@ -228,17 +278,42 @@ impl Component for FanModel {
                         return;
                     }
 
+                    // Re-read active profile after the async D-Bus probe in case
+                    // `power_auto` activated a different profile during startup.
+                    let saved_profile =
+                        FanProfile::from(AppConfig::load().active_profile().fan_profile);
+
                     match dbus::get_fan_profile().await {
-                        Ok(current) if current == saved_profile => {
-                            dbus::spawn_sync_power_profile(current);
+                        Ok(current)
+                            if dbus::is_equivalent_fan_profile(current, saved_profile) =>
+                        {
+                            dbus::sync_power_profile_now(current).await;
                             out.emit(FanCommandOutput::InitialProfile(current));
                         }
-                        Ok(_) => match dbus::set_fan_profile(saved_profile).await {
-                            Ok(p) => out.emit(FanCommandOutput::ProfileSet(p)),
-                            Err(e) => out.emit(FanCommandOutput::Error(e)),
+                        Ok(_) => match dbus::set_platform_profile_only(saved_profile).await {
+                            Ok(p) => {
+                                dbus::sync_power_profile_now(p).await;
+                                out.emit(FanCommandOutput::ProfileSet(p));
+                            }
+                            Err(e) => {
+                                out.emit(FanCommandOutput::Error(e));
+                                return;
+                            }
                         },
-                        Err(e) => out.emit(FanCommandOutput::Error(e)),
+                        Err(e) => {
+                            out.emit(FanCommandOutput::Error(e));
+                            return;
+                        }
                     }
+
+                    let (ext_tx, mut ext_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let watcher = dbus::watch_external_fan_profile_changes(ext_tx);
+                    let forwarder = async move {
+                        while let Some((source, profile)) = ext_rx.recv().await {
+                            out.emit(FanCommandOutput::ExternalProfileChanged { source, profile });
+                        }
+                    };
+                    tokio::join!(watcher, forwarder);
                 })
                 .drop_on_shutdown()
         });
@@ -249,11 +324,12 @@ impl Component for FanModel {
     fn update(&mut self, msg: FanMsg, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             FanMsg::ChangeProfile(profile) => {
-                if profile == self.current_profile {
+                if dbus::is_equivalent_fan_profile(profile, self.current_profile) {
                     return;
                 }
                 self.current_profile = profile;
                 AppConfig::update(|c| c.active_profile_mut().fan_profile = profile as u32);
+                self.emit_state(&sender);
 
                 sender.command(move |out, shutdown| {
                     shutdown
@@ -273,11 +349,8 @@ impl Component for FanModel {
                 let target = next_profile(self.current_profile);
                 self.current_profile = target;
                 AppConfig::update(|c| c.active_profile_mut().fan_profile = target as u32);
-
-                self.check_performance.set_active(target == FanProfile::Performance);
-                self.check_balanced.set_active(target == FanProfile::Balanced);
-                self.check_quiet
-                    .set_active(target == FanProfile::Quiet || target == FanProfile::LowPower);
+                self.sync_radio_buttons(target);
+                self.emit_state(&sender);
 
                 sender.command(move |out, shutdown| {
                     shutdown
@@ -290,15 +363,35 @@ impl Component for FanModel {
                         .drop_on_shutdown()
                 });
             }
-            FanMsg::LoadProfile(profile) => {
-                if !self.asusd_available {
+            FanMsg::SetFromTray(profile) => {
+                if !self.asusd_available
+                    || dbus::is_equivalent_fan_profile(profile, self.current_profile)
+                {
                     return;
                 }
                 self.current_profile = profile;
-                self.check_performance.set_active(profile == FanProfile::Performance);
-                self.check_balanced.set_active(profile == FanProfile::Balanced);
-                self.check_quiet
-                    .set_active(profile == FanProfile::Quiet || profile == FanProfile::LowPower);
+                AppConfig::update(|c| c.active_profile_mut().fan_profile = profile as u32);
+                self.sync_radio_buttons(profile);
+                self.emit_state(&sender);
+
+                sender.command(move |out, shutdown| {
+                    shutdown
+                        .register(async move {
+                            match dbus::set_fan_profile(profile).await {
+                                Ok(p) => out.emit(FanCommandOutput::ProfileSet(p)),
+                                Err(e) => out.emit(FanCommandOutput::Error(e)),
+                            }
+                        })
+                        .drop_on_shutdown()
+                });
+            }
+            FanMsg::LoadProfile(profile) => {
+                self.current_profile = profile;
+                self.sync_radio_buttons(profile);
+                self.emit_state(&sender);
+                if !self.asusd_available {
+                    return;
+                }
 
                 sender.command(move |out, shutdown| {
                     shutdown
@@ -336,13 +429,12 @@ impl Component for FanModel {
         match msg {
             FanCommandOutput::AsusdChecked(available) => {
                 self.asusd_available = available;
+                self.emit_state(&sender);
             }
             FanCommandOutput::InitialProfile(profile) => {
                 self.current_profile = profile;
-                self.check_performance.set_active(profile == FanProfile::Performance);
-                self.check_balanced.set_active(profile == FanProfile::Balanced);
-                self.check_quiet
-                    .set_active(profile == FanProfile::Quiet || profile == FanProfile::LowPower);
+                self.sync_radio_buttons(profile);
+                self.emit_state(&sender);
             }
             FanCommandOutput::ProfileSet(profile) => {
                 let name = match profile {
@@ -353,21 +445,39 @@ impl Component for FanModel {
                 };
                 tracing::info!("{}", t!("fan_profile_set", profile = name));
                 self.current_profile = profile;
+                self.emit_state(&sender);
                 fan_osd::show(profile, AppConfig::load().fan_osd_enabled);
 
                 // power-profiles-daemon updates EPP slightly asynchronously after asusd switches profile.
-                sender.command(|out, shutdown| {
-                    shutdown
-                        .register(async move {
-                            tokio::time::sleep(Duration::from_millis(350)).await;
-                            if let Ok(tel) =
-                                tokio::task::spawn_blocking(read_cpu_power_telemetry).await
-                            {
-                                out.emit(FanCommandOutput::CpuTelemetryRead(tel));
-                            }
-                        })
-                        .drop_on_shutdown()
-                });
+                self.spawn_refresh_cpu_telemetry(&sender);
+            }
+            FanCommandOutput::ExternalProfileChanged { source, profile } => {
+                if dbus::is_equivalent_fan_profile(profile, self.current_profile) {
+                    return;
+                }
+                self.current_profile = profile;
+                AppConfig::update(|c| c.active_profile_mut().fan_profile = profile as u32);
+                self.sync_radio_buttons(profile);
+                self.emit_state(&sender);
+                fan_osd::show(profile, AppConfig::load().fan_osd_enabled);
+
+                match source {
+                    dbus::ExternalProfileSource::Asusd => {
+                        dbus::spawn_sync_power_profile(profile);
+                    }
+                    dbus::ExternalProfileSource::PowerProfiles => {
+                        sender.command(move |out, shutdown| {
+                            shutdown
+                                .register(async move {
+                                    if let Err(e) = dbus::set_platform_profile_only(profile).await {
+                                        out.emit(FanCommandOutput::Error(e));
+                                    }
+                                })
+                                .drop_on_shutdown()
+                        });
+                    }
+                }
+                self.spawn_refresh_cpu_telemetry(&sender);
             }
             FanCommandOutput::CpuTelemetryRead(tel) => {
                 if let Some(summary) = format_cpu_telemetry(&tel) {
@@ -378,7 +488,7 @@ impl Component for FanModel {
                 }
             }
             FanCommandOutput::Error(e) => {
-                let _ = sender.output(e);
+                let _ = sender.output(FanOutput::Error(e));
             }
         }
     }

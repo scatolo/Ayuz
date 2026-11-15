@@ -123,11 +123,22 @@ impl BatteryModel {
 
 /// Input messages for the battery component.
 #[derive(Debug)]
+pub enum BatteryOutput {
+    Error(String),
+    ChargeLimitChanged {
+        limit: u8,
+        asusd_available: bool,
+    },
+}
+
+#[derive(Debug)]
 pub enum BatteryMsg {
     /// Select a charge-limit preset index from `limit_combo`.
     SelectChargeLimit(u32),
     /// Enable or disable the temporary 100% full-charge mode (auto-reverts after 24 h).
     ToggleFullCharge(bool),
+    /// Toggle between 80% Battery Maintenance (`<= 80`) and 100% full capacity from the tray.
+    ToggleMaintenanceFromTray,
     /// Switch suspend-to-RAM between `s2idle` (`false`) and `deep` (`true`).
     ToggleDeepSleep(bool),
     /// Apply deep-sleep setting from a profile without saving.
@@ -170,7 +181,7 @@ pub enum BatteryCommandOutput {
 impl Component for BatteryModel {
     type Init = ();
     type Input = BatteryMsg;
-    type Output = String;
+    type Output = BatteryOutput;
     type CommandOutput = BatteryCommandOutput;
 
     view! {
@@ -372,7 +383,9 @@ impl Component for BatteryModel {
             }
             BatteryMsg::ToggleDeepSleep(active) => {
                 if active && !self.deep_sleep_supported {
-                    let _ = sender.output(t!("battery_deep_sleep_not_supported").to_string());
+                    let _ = sender.output(BatteryOutput::Error(
+                        t!("battery_deep_sleep_not_supported").to_string(),
+                    ));
                     return;
                 }
                 if active == self.deep_sleep_active {
@@ -478,6 +491,47 @@ impl Component for BatteryModel {
                     });
                 }
             }
+            BatteryMsg::ToggleMaintenanceFromTray => {
+                if !self.asusd_available {
+                    return;
+                }
+                let target = if self.charge_limit <= 80 { 100 } else { 80 };
+                let prev_limit = self.charge_limit;
+                let prev_saved = self.saved_limit;
+                let prev_full = self.full_charge_active;
+
+                if let Some(cancel) = self.timer_cancel.take() {
+                    let _ = cancel.send(());
+                }
+
+                self.full_charge_active = false;
+                self.charge_limit = target;
+                if target < 100 {
+                    self.saved_limit = target;
+                }
+                self.limit_presets = build_limit_presets(Some(target));
+                self.sync_limit_combo();
+                let _ = sender.output(BatteryOutput::ChargeLimitChanged {
+                    limit: target,
+                    asusd_available: self.asusd_available,
+                });
+
+                sender.command(move |out, shutdown| {
+                    shutdown
+                        .register(async move {
+                            match dbus::set_charge_limit(target).await {
+                                Ok(val) => out.emit(BatteryCommandOutput::ChargeLimitSet(val)),
+                                Err(error) => out.emit(BatteryCommandOutput::ChargeLimitError {
+                                    error,
+                                    revert_limit: prev_limit,
+                                    revert_saved_limit: prev_saved,
+                                    revert_full_charge: prev_full,
+                                }),
+                            }
+                        })
+                        .drop_on_shutdown()
+                });
+            }
             BatteryMsg::RefreshStats => {
                 sender.command(|out, shutdown| {
                     shutdown
@@ -503,6 +557,10 @@ impl Component for BatteryModel {
         match msg {
             BatteryCommandOutput::AsusdChecked(available) => {
                 self.asusd_available = available;
+                let _ = sender.output(BatteryOutput::ChargeLimitChanged {
+                    limit: self.charge_limit,
+                    asusd_available: available,
+                });
             }
             BatteryCommandOutput::InitValue(val) => {
                 self.limit_presets = build_limit_presets(Some(val));
@@ -512,6 +570,10 @@ impl Component for BatteryModel {
                 }
                 self.full_charge_active = false;
                 self.sync_limit_combo();
+                let _ = sender.output(BatteryOutput::ChargeLimitChanged {
+                    limit: val,
+                    asusd_available: self.asusd_available,
+                });
             }
             BatteryCommandOutput::InitDeepSleep(active) => {
                 self.deep_sleep_active = active;
@@ -532,6 +594,11 @@ impl Component for BatteryModel {
                 tracing::info!("{}", t!("battery_deep_sleep_set", value = value));
             }
             BatteryCommandOutput::ChargeLimitSet(val) => {
+                self.charge_limit = val;
+                let _ = sender.output(BatteryOutput::ChargeLimitChanged {
+                    limit: val,
+                    asusd_available: self.asusd_available,
+                });
                 tracing::info!(
                     "{}",
                     t!("battery_charge_limit_set", value = val.to_string())
@@ -550,10 +617,14 @@ impl Component for BatteryModel {
                 self.saved_limit = revert_saved_limit;
                 self.full_charge_active = revert_full_charge;
                 self.sync_limit_combo();
-                let _ = sender.output(error);
+                let _ = sender.output(BatteryOutput::ChargeLimitChanged {
+                    limit: revert_limit,
+                    asusd_available: self.asusd_available,
+                });
+                let _ = sender.output(BatteryOutput::Error(error));
             }
             BatteryCommandOutput::Error(e) => {
-                let _ = sender.output(e);
+                let _ = sender.output(BatteryOutput::Error(e));
             }
             BatteryCommandOutput::TimerElapsed => {
                 let prev_limit = self.charge_limit;

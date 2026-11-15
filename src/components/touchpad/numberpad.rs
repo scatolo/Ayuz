@@ -54,11 +54,16 @@ pub enum NumberpadMsg {
     SyncActive(bool),
 }
 
+#[derive(Debug)]
+pub enum NumberpadOutput {
+    SupportDetected(bool),
+}
+
 #[relm4::component(pub)]
 impl Component for NumberpadModel {
     type Init = ();
     type Input = NumberpadMsg;
-    type Output = String;
+    type Output = NumberpadOutput;
     type CommandOutput = NumberpadStatus;
 
     view! {
@@ -122,6 +127,8 @@ impl Component for NumberpadModel {
         match msg {
             NumberpadMsg::Probed(status) => {
                 self.status = status;
+                let supported = !matches!(self.status, NumberpadStatus::NoHardware);
+                let _ = sender.output(NumberpadOutput::SupportDetected(supported));
                 // If hardware probe failed but the persisted profile had this
                 // enabled, leave self.enabled untouched - the switch is just
                 // insensitive, so the user can't toggle it on. Profile state

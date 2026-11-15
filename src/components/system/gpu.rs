@@ -38,6 +38,12 @@ pub struct GpuModel {
 
 /// Input messages for the GPU mode component.
 #[derive(Debug)]
+pub enum GpuOutput {
+    Error(String),
+    SupportDetected(bool),
+}
+
+#[derive(Debug)]
 pub enum GpuMsg {
     /// User selected index `idx` in the mode dropdown.
     ChangeMode(u32),
@@ -48,8 +54,11 @@ pub enum GpuMsg {
 /// Async command results for the GPU mode component.
 #[derive(Debug)]
 pub enum GpuCommandOutput {
-    /// Result of the initial `supergfxctl` availability check.
-    SupergfxctlChecked(bool),
+    /// Result of the initial `supergfxctl` and discrete GPU availability check.
+    SupergfxctlChecked {
+        available: bool,
+        has_dgpu: Option<bool>,
+    },
     /// Current mode and the list of modes available for switching, read at startup.
     InitModeAndSupported(GfxMode, Vec<GfxMode>),
     /// Confirmation that `SetMode` succeeded; carries the daemon-confirmed new mode.
@@ -62,7 +71,7 @@ pub enum GpuCommandOutput {
 impl Component for GpuModel {
     type Init = ();
     type Input = GpuMsg;
-    type Output = String;
+    type Output = GpuOutput;
     type CommandOutput = GpuCommandOutput;
 
     view! {
@@ -133,7 +142,14 @@ impl Component for GpuModel {
             shutdown
                 .register(async move {
                     let available = dbus::check_supergfxctl_available().await;
-                    out.emit(GpuCommandOutput::SupergfxctlChecked(available));
+                    let has_dgpu = tokio::task::spawn_blocking(crate::sys_paths::has_discrete_gpu)
+                        .await
+                        .ok()
+                        .flatten();
+                    out.emit(GpuCommandOutput::SupergfxctlChecked {
+                        available,
+                        has_dgpu,
+                    });
 
                     if !available {
                         return;
@@ -214,8 +230,14 @@ impl Component for GpuModel {
         _root: &Self::Root,
     ) {
         match msg {
-            GpuCommandOutput::SupergfxctlChecked(available) => {
+            GpuCommandOutput::SupergfxctlChecked {
+                available,
+                has_dgpu,
+            } => {
                 self.supergfxctl_available = available;
+                let _ = sender.output(GpuOutput::SupportDetected(
+                    available || has_dgpu.unwrap_or(false),
+                ));
             }
             GpuCommandOutput::InitModeAndSupported(current, supported) => {
                 // Build display list: active mode first, then any additional supported modes.
@@ -246,7 +268,7 @@ impl Component for GpuModel {
                 );
             }
             GpuCommandOutput::Error(e) => {
-                let _ = sender.output(e);
+                let _ = sender.output(GpuOutput::Error(e));
             }
         }
     }
