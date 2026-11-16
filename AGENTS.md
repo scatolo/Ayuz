@@ -6,7 +6,7 @@ Repository guidance for coding agents and contributors working on **Ayuz** (`sca
 
 ## 1. Fork Identity & Target Scope
 
-- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.2.1` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
+- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.2.2` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
 - **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 / 45 · GNOME (Wayland)**.
 - **Upstream Target Retained**: **ASUS Zenbook S16** running **Fedora 43 · KDE Plasma (Wayland)** (and COSMIC where supported).
 - **Explicit Scope Boundaries**:
@@ -63,8 +63,8 @@ CI workflow `.github/workflows/release.yml` runs on pushes to `main`, tags match
 - **`build-rpm`**, **`build-deb`**, **`build-appimage`**, and **`release`** only run when `check` passes and `should_release == 'true'` (new tag, new version on `main`, or `workflow_dispatch` with missing tag/release or `force_release=true`):
   - **RPM** (`quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45` matrix, `rpm-build` + `cargo-generate-rpm`):
     ```bash
-    PKG_VERSION="1.2.1"                # must match Cargo.toml [package].version
-    RPM_VERSION="${PKG_VERSION//-/+}"  # e.g. 1.2.1
+    PKG_VERSION="1.2.2"                # must match Cargo.toml [package].version
+    RPM_VERSION="${PKG_VERSION//-/+}"  # e.g. 1.2.2
     FEDORA_VERSION="45"                # 44 or 45 in CI matrix
     cargo build --release --locked && strip -s target/release/ayuz
     cargo generate-rpm -s "version = \"${RPM_VERSION}\"" -s "release = \"1.fc${FEDORA_VERSION}\""
@@ -128,7 +128,7 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
 | `src/components/aura/`, `animatrix/` | Dynamic `asusd` Aura RGB device pages (`aura_page.rs`, `aura_device.rs`) and AniMatrix LED matrix controls + GIF gallery (`animatrix.rs`). |
 | `src/components/touchpad/` | `touchpad.rs` (10s auto-revert safety timer), `numberpad.rs`, `gestures.rs` (requires `playerctl`; brightness gate satisfied on GNOME/KDE or `brightnessctl`), `typing.rs`. |
 | `src/components/audio/`, `system/` | `volume.rs` (`wpctl` + `pactl subscribe` with `wpctl` polling fallback), `sound_modes.rs` (`easyeffects`, auto-detecting 7.x vs 8.x preset dirs and service flags), `battery.rs` (`asusd` charge limit + `/sys/power/mem_sleep`), `fan.rs` + `fan_osd.rs` (`gtk4-layer-shell` with regular window fallback), `gpu.rs` (`supergfxctl`), `apu_mem.rs` (`asusd`). |
-| `locales/` | `en.yml`, `de.yml`, `pt-br.yml` (`rust-i18n`, fallback `"en"`). |
+| `locales/` | `en.yml`, `de.yml`, `it.yml`, `pt-br.yml` (`rust-i18n`, fallback `"en"`). |
 | `packaging/`, `.github/workflows/` | `.desktop` files, AppStream metainfo (`de.guido.ayuz.metainfo.xml`), `udev/99-ayuz-numberpad.rules`, `release.yml`, plus root `dist-workspace.toml` and `flake.nix`. |
 | `assets/` | `style.css`, `trayicon.png`, `img/`, `icm/`, `presets/` (EasyEffects), `anime/` (AniMatrix GIFs/images). |
 
@@ -147,6 +147,6 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
    - Add field to `Profile` in `src/services/config.rs` with `#[serde(default = "...")]` and update `Profile::default()`.
    - Emit `LoadProfile` in `AppModel::distribute_profile` (`src/app.rs`).
    - Add widget to `widget_map` in `src/app.rs` and to `SEARCH_INDEX` in `src/search.rs`.
-   - Add translation keys to **all three** files: `locales/en.yml`, `locales/de.yml`, and `locales/pt-br.yml`.
+   - Add translation keys to **all four** files: `locales/en.yml`, `locales/de.yml`, `locales/it.yml`, and `locales/pt-br.yml`.
 9. **Headless unit tests**: CI runs `cargo test --locked` inside `quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45` with no display server, no D-Bus session/system services, and no ASUS hardware. Keep unit tests decoupled from live `/sys`, `/dev`, D-Bus, and GTK display initialization (follow the mock-directory pattern in `src/sys_paths.rs` and pure-function tests in `src/services/gnome_brightness.rs`, `src/services/edge_gestures.rs`, and `src/services/numberpad_layouts.rs`).
 10. **End-of-session Git commands**: Whenever a session modifies repository files, end the final response with ready-to-run, clean `git add`, `git commit`, and `git push` commands (scoping `git add` explicitly to the modified files and suggesting a clear, concise commit message).

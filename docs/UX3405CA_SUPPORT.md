@@ -1,6 +1,6 @@
 # ASUS Zenbook 14 OLED (UX3405CA) & Fedora 44 / 45 GNOME Wayland Support
 
-Technical reference for the `scatolo/Ayuz` fork (`1.2.1`), documenting how Ayuz adapts to **ASUS Zenbook 14 OLED (UX3405CA)** on **Fedora 44 / 45 · GNOME (Wayland)** (GNOME 48–51) and how automated releases are built.
+Technical reference for the `scatolo/Ayuz` fork (`1.2.2`), documenting how Ayuz adapts to **ASUS Zenbook 14 OLED (UX3405CA)** on **Fedora 44 / 45 · GNOME (Wayland)** (GNOME 48–51) and how automated releases are built.
 
 ---
 

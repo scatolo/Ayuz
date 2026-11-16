@@ -483,4 +483,17 @@ mod tests {
         assert_eq!(parsed.ac_profile_id.as_deref(), Some("ac1"));
         assert_eq!(parsed.battery_profile_id.as_deref(), Some("bat1"));
     }
+
+    #[test]
+    fn test_app_config_deserializes_italian_language() {
+        let json = r#"{
+            "language": "it",
+            "skip_legacy_migration": false,
+            "active_profile_id": "p1",
+            "profiles": []
+        }"#;
+
+        let cfg: AppConfig = serde_json::from_str(json).expect("valid italian app config");
+        assert_eq!(cfg.language, "it");
+    }
 }

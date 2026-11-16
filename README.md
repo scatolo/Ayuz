@@ -191,7 +191,7 @@ If any of these are missing the NumberPad row in the Touchpad page is disabled a
 - **System tray** - minimize to tray, restore or quit from tray menu
 - **Autostart** - optional autostart with the system; when enabled, the app launches hidden (`--hidden`) and only appears in the tray. Managed via a `.desktop` file at `~/.config/autostart/de.guido.ayuz.desktop`
 - **Persistent configuration** - settings are saved to `~/.config/ayuz/config.json` and restored on every launch
-- **Multilingual UI** - English, German, and Brazilian Portuguese supported, switchable at runtime
+- **Multilingual UI** - English, German, Italian, and Brazilian Portuguese supported, switchable at runtime
 - **Toast notifications** - errors and status messages shown as non-blocking toasts
 - **Dynamic hardware telemetry** - automatically discovers battery sysfs entries across `/sys/class/power_supply/*` (not restricted to `BAT0`/`BAT1`) and locates CPU temperature sensors via `/sys/class/hwmon` (`coretemp`, `k10temp`, `zenpower`, or `*cpu*`), falling back to `/sys/class/thermal/thermal_zone0/temp`
 
@@ -255,18 +255,18 @@ Pre-built **`.rpm`**, **`.deb`**, and **`.AppImage`** packages for this porting 
    - **Fedora 44 / 45 (RPM):**
      ```bash
      # Fedora 44:
-     sudo dnf install ./ayuz-1.2.1-1.fc44.x86_64.rpm
+     sudo dnf install ./ayuz-1.2.2-1.fc44.x86_64.rpm
      # Fedora 45:
-     sudo dnf install ./ayuz-1.2.1-1.fc45.x86_64.rpm
+     sudo dnf install ./ayuz-1.2.2-1.fc45.x86_64.rpm
      ```
    - **Debian / Ubuntu / DEB-based:**
      ```bash
-     sudo apt install ./ayuz_1.2.1-1_amd64.deb
+     sudo apt install ./ayuz_1.2.2-1_amd64.deb
      ```
    - **AppImage (any distribution):**
      ```bash
-     chmod +x ayuz-1.2.1-x86_64.AppImage
-     ./ayuz-1.2.1-x86_64.AppImage
+     chmod +x ayuz-1.2.2-x86_64.AppImage
+     ./ayuz-1.2.2-x86_64.AppImage
      ```
 
 2. **Enable permissions for Touchpad Smart Gestures & While Typing:**
@@ -410,21 +410,21 @@ Download the package matching your distribution from this fork's [GitHub Release
 
   ```bash
   # Fedora 44:
-  sudo dnf install ./ayuz-1.2.1-1.fc44.x86_64.rpm
+  sudo dnf install ./ayuz-1.2.2-1.fc44.x86_64.rpm
   # Fedora 45:
-  sudo dnf install ./ayuz-1.2.1-1.fc45.x86_64.rpm
+  sudo dnf install ./ayuz-1.2.2-1.fc45.x86_64.rpm
   ```
 
 - **Debian / Ubuntu / DEB-based:**
 
   ```bash
-  sudo apt install ./ayuz_1.2.1-1_amd64.deb
+  sudo apt install ./ayuz_1.2.2-1_amd64.deb
   ```
 
 - **AppImage (any distribution):**
   ```bash
-  chmod +x ayuz-1.2.1-x86_64.AppImage
-  ./ayuz-1.2.1-x86_64.AppImage
+  chmod +x ayuz-1.2.2-x86_64.AppImage
+  ./ayuz-1.2.2-x86_64.AppImage
   ```
 
 **Note for AppImage users:** Because the AppImage runs without root privileges, it cannot install the necessary hardware permissions for the ASUS NumberPad automatically. If you want to use the NumberPad feature, please follow the manual `udev` rules installation in the NumberPad Requirements section above.
@@ -488,7 +488,7 @@ cargo appimage
 
 Contributions are welcome. If you own a different ASUS laptop model and want to add or fix support for specific features, feel free to open an issue or pull request.
 
-When adding a new feature, follow the existing component pattern in `src/components/` and add corresponding translation keys to both `locales/en.yml` and `locales/de.yml`.
+When adding a new feature, follow the existing component pattern in `src/components/` and add corresponding translation keys to `locales/en.yml`, `locales/de.yml`, `locales/it.yml`, and `locales/pt-br.yml`.
 
 ---
 

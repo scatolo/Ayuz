@@ -90,3 +90,28 @@ fn main() {
     relm4::adw::StyleManager::default().set_color_scheme(relm4::adw::ColorScheme::PreferDark);
     a.run::<app::AppModel>(start_hidden);
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_italian_locale_available_and_translates() {
+        let locales = rust_i18n::available_locales!();
+        assert!(
+            locales.contains(&"it"),
+            "expected 'it' in available_locales: {:?}",
+            locales
+        );
+        assert_eq!(
+            rust_i18n::t!("language_title", locale = "it").as_ref(),
+            "Lingua"
+        );
+        assert_eq!(
+            rust_i18n::t!("tab_keyboard", locale = "it").as_ref(),
+            "Tastiera"
+        );
+        assert_eq!(
+            rust_i18n::t!("gestures_group_title", locale = "it").as_ref(),
+            "Smart Gestures"
+        );
+    }
+}

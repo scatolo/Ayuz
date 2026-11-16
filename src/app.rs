@@ -1428,6 +1428,7 @@ fn build_language_and_autostart_group(
     const SUPPORTED_LANGS: &[(&str, &str)] = &[
         ("English", "en"),
         ("Deutsch", "de"),
+        ("Italiano", "it"),
         ("Português Brasileiro", "pt-br"),
     ];
 
