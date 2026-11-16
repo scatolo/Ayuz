@@ -41,6 +41,7 @@ assets = [
     ["assets/trayicon.png", "usr/share/icons/hicolor/128x128/apps/de.guido.ayuz.png", "644"],
     ["assets/anime/**/*.gif", "usr/share/ayuz/anime/", "644"],
     ["packaging/udev/99-ayuz-numberpad.rules", "usr/lib/udev/rules.d/99-ayuz-numberpad.rules", "644"],
+    ["packaging/tmpfiles.d/ayuz-cpu-tuning.conf", "usr/lib/tmpfiles.d/ayuz-cpu-tuning.conf", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -51,8 +52,14 @@ assets = [
     { source = "packaging/de.guido.ayuz.metainfo.xml", dest = "/usr/share/metainfo/de.guido.ayuz.metainfo.xml", mode = "644" },
     { source = "assets/trayicon.png", dest = "/usr/share/icons/hicolor/128x128/apps/de.guido.ayuz.png", mode = "644" },
     { source = "assets/anime/**/*.gif", dest = "/usr/share/ayuz/anime/", mode = "644" },
-    { source = "packaging/udev/99-ayuz-numberpad.rules", dest = "/usr/lib/udev/rules.d/99-ayuz-numberpad.rules", mode = "644" }
+    { source = "packaging/udev/99-ayuz-numberpad.rules", dest = "/usr/lib/udev/rules.d/99-ayuz-numberpad.rules", mode = "644" },
+    { source = "packaging/tmpfiles.d/ayuz-cpu-tuning.conf", dest = "/usr/lib/tmpfiles.d/ayuz-cpu-tuning.conf", mode = "644" }
 ]
+post_install_script = """
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/ayuz-cpu-tuning.conf >/dev/null 2>&1 || :
+fi
+"""
 
 [package.metadata.appimage]
 auto_link = true

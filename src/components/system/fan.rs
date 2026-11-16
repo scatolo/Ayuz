@@ -14,6 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gtk4 as gtk;
@@ -24,9 +27,14 @@ use rust_i18n::t;
 
 use crate::components::system::fan_osd;
 use crate::services::config::AppConfig;
+use crate::services::cpu_tuning::{
+    self, ApplyMaxPerfOutcome, build_max_perf_presets, format_max_perf_preset_label,
+};
 use crate::services::dbus;
 use crate::services::dbus::FanProfile;
-use crate::sys_paths::{CpuPowerTelemetry, read_cpu_power_telemetry};
+use crate::sys_paths::{CpuPowerTelemetry, clamp_perf_pct, read_cpu_power_telemetry};
+
+static MAX_PERF_APPLY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Cycles Balanced → Performance → Quiet → Balanced. `LowPower` is treated as
 /// `Quiet` for cycling purposes (TUF laptops); the daemon falls back internally.
@@ -38,8 +46,8 @@ fn next_profile(current: FanProfile) -> FanProfile {
     }
 }
 
-/// Formats read-only CPU EPP, governor, and Intel Turbo Boost telemetry for display.
-/// Returns `None` when none of the sysfs telemetry files are readable on this host.
+/// Formats read-only CPU EPP, governor, Intel Turbo Boost, and `intel_pstate` perf limits for display.
+/// Returns `None` when none of the sysfs telemetry fields are readable on this host.
 pub fn format_cpu_telemetry(tel: &CpuPowerTelemetry) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(epp) = tel.epp.as_deref() {
@@ -56,6 +64,14 @@ pub fn format_cpu_telemetry(tel: &CpuPowerTelemetry) -> Option<String> {
         };
         parts.push(t!("fan_cpu_turbo", state = state).to_string());
     }
+    if let Some(max_pct) = tel.max_perf_pct {
+        parts.push(t!("fan_cpu_max_perf", pct = max_pct.to_string()).to_string());
+    }
+    if let Some(min_pct) = tel.min_perf_pct
+        && min_pct >= 95
+    {
+        parts.push(t!("fan_cpu_min_perf_high", pct = min_pct.to_string()).to_string());
+    }
 
     if parts.is_empty() {
         None
@@ -66,14 +82,24 @@ pub fn format_cpu_telemetry(tel: &CpuPowerTelemetry) -> Option<String> {
 
 /// State for the fan profile settings component.
 pub struct FanModel {
-    /// Whether the `asusd` daemon is reachable; disables all controls when `false`.
+    /// Whether the `asusd` daemon is reachable; disables fan profile controls when `false`.
     asusd_available: bool,
     /// The currently active fan profile, used to suppress no-op toggle callbacks.
     current_profile: FanProfile,
-    /// Read-only CPU EPP / governor / Turbo Boost summary.
+    /// Read-only CPU EPP / governor / Turbo Boost / `max_perf_pct` summary.
     cpu_telemetry_subtitle: String,
     /// Only show the CPU telemetry row when at least one cpufreq/intel_pstate field exists.
     cpu_telemetry_available: bool,
+    /// Whether `/sys/devices/system/cpu/intel_pstate/max_perf_pct` exists on this CPU.
+    max_perf_supported: bool,
+    /// Whether `max_perf_pct` is writable without `pkexec` (via `systemd-tmpfiles` + `input`).
+    pstate_writable: bool,
+    /// Selected per-profile `max_perf_pct` ceiling (`None` = system default / 100%).
+    cpu_max_perf_pct: Option<u8>,
+    /// Available dropdown presets (`[None, Some(60), ..., Some(100)]`).
+    max_perf_presets: Vec<Option<u8>>,
+    max_perf_combo: adw::ComboRow,
+    suppress_signals: Rc<Cell<bool>>,
     check_performance: gtk::CheckButton,
     check_balanced: gtk::CheckButton,
     check_quiet: gtk::CheckButton,
@@ -84,13 +110,18 @@ pub struct FanModel {
 pub enum FanMsg {
     /// Switch to the given fan profile and persist the choice.
     ChangeProfile(FanProfile),
-    /// Apply a profile without saving (called when switching hardware profiles).
-    LoadProfile(FanProfile),
+    /// Apply fan profile and CPU max-performance ceiling from a hardware profile without saving.
+    LoadProfile {
+        profile: FanProfile,
+        cpu_max_perf_pct: Option<u8>,
+    },
+    /// Select a CPU `max_perf_pct` preset index from `max_perf_combo`.
+    SelectMaxPerf(u32),
     /// Cycle to the next profile (triggered by the FN+F global hotkey).
     CycleFromHotkey,
     /// Apply a fan profile selected from the system tray menu.
     SetFromTray(FanProfile),
-    /// Refresh read-only CPU EPP / Turbo telemetry from sysfs.
+    /// Refresh read-only CPU EPP / Turbo / `intel_pstate` telemetry from sysfs.
     RefreshTelemetry,
 }
 
@@ -118,6 +149,11 @@ pub enum FanCommandOutput {
         source: dbus::ExternalProfileSource,
         profile: FanProfile,
     },
+    /// Result of applying `intel_pstate/max_perf_pct`.
+    MaxPerfApplied {
+        outcome: ApplyMaxPerfOutcome,
+        is_profile_load: bool,
+    },
     /// Read-only CPU EPP / Turbo telemetry snapshot.
     CpuTelemetryRead(CpuPowerTelemetry),
     /// An error message to forward as a toast notification.
@@ -134,6 +170,27 @@ impl FanModel {
             .set_active(profile == FanProfile::Quiet || profile == FanProfile::LowPower);
     }
 
+    fn sync_max_perf_combo(&self) {
+        let labels: Vec<String> = self
+            .max_perf_presets
+            .iter()
+            .map(|&p| format_max_perf_preset_label(p))
+            .collect();
+        let str_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let normalized = self.cpu_max_perf_pct.map(clamp_perf_pct);
+        let selected_idx = self
+            .max_perf_presets
+            .iter()
+            .position(|&p| p == normalized)
+            .unwrap_or(0) as u32;
+
+        self.suppress_signals.set(true);
+        self.max_perf_combo
+            .set_model(Some(&gtk::StringList::new(&str_refs)));
+        self.max_perf_combo.set_selected(selected_idx);
+        self.suppress_signals.set(false);
+    }
+
     fn emit_state(&self, sender: &ComponentSender<Self>) {
         let _ = sender.output(FanOutput::StateChanged {
             profile: self.current_profile,
@@ -145,7 +202,48 @@ impl FanModel {
         sender.command(|out, shutdown| {
             shutdown
                 .register(async move {
-                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    // Wait for tuned-ppd / power-profiles-daemon to finish applying EPP/min_perf_pct.
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    if let Ok(tel) =
+                        tokio::task::spawn_blocking(read_cpu_power_telemetry).await
+                    {
+                        out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                    }
+                })
+                .drop_on_shutdown()
+        });
+    }
+
+    fn spawn_apply_max_perf(
+        &self,
+        configured: Option<u8>,
+        prev_configured: Option<u8>,
+        delay_ms: u64,
+        is_profile_load: bool,
+        sender: &ComponentSender<Self>,
+    ) {
+        let seq = MAX_PERF_APPLY_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        sender.command(move |out, shutdown| {
+            shutdown
+                .register(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    if MAX_PERF_APPLY_SEQ.load(Ordering::SeqCst) != seq {
+                        return;
+                    }
+                    match cpu_tuning::apply_max_perf_pct(configured, prev_configured).await {
+                        Ok(outcome) => {
+                            if MAX_PERF_APPLY_SEQ.load(Ordering::SeqCst) != seq {
+                                return;
+                            }
+                            out.emit(FanCommandOutput::MaxPerfApplied {
+                                outcome,
+                                is_profile_load,
+                            });
+                        }
+                        Err(e) => out.emit(FanCommandOutput::Error(e)),
+                    }
                     if let Ok(tel) =
                         tokio::task::spawn_blocking(read_cpu_power_telemetry).await
                     {
@@ -210,6 +308,22 @@ impl Component for FanModel {
                 #[watch]
                 set_visible: model.cpu_telemetry_available,
             },
+
+            #[template]
+            add = &crate::components::widgets::DaemonWarningLabel {
+                #[watch]
+                set_visible: model.max_perf_supported && !model.pstate_writable,
+                set_label: &t!("fan_cpu_max_perf_permission_warning"),
+            },
+
+            add = &model.max_perf_combo.clone() -> adw::ComboRow {
+                set_title: &t!("fan_cpu_max_perf_title"),
+                set_subtitle: &t!("fan_cpu_max_perf_subtitle"),
+                #[watch]
+                set_visible: model.max_perf_supported,
+                #[watch]
+                set_sensitive: model.max_perf_supported && model.pstate_writable,
+            },
         }
     }
 
@@ -226,7 +340,9 @@ impl Component for FanModel {
         check_quiet.set_group(Some(&check_performance));
 
         let config = AppConfig::load();
-        let saved_profile = FanProfile::from(config.active_profile().fan_profile);
+        let active_profile = config.active_profile();
+        let saved_profile = FanProfile::from(active_profile.fan_profile);
+        let saved_max_perf = active_profile.cpu_max_perf_pct.map(clamp_perf_pct);
         match saved_profile {
             FanProfile::Performance => check_performance.set_active(true),
             FanProfile::Balanced => check_balanced.set_active(true),
@@ -246,15 +362,35 @@ impl Component for FanModel {
             });
         }
 
+        let max_perf_combo = adw::ComboRow::new();
+        let suppress_signals = Rc::new(Cell::new(false));
+        {
+            let sender = sender.clone();
+            let suppress = suppress_signals.clone();
+            max_perf_combo.connect_selected_notify(move |row| {
+                if suppress.get() {
+                    return;
+                }
+                sender.input(FanMsg::SelectMaxPerf(row.selected()));
+            });
+        }
+
         let model = FanModel {
             asusd_available: false,
             current_profile: saved_profile,
             cpu_telemetry_subtitle: String::new(),
             cpu_telemetry_available: false,
+            max_perf_supported: false,
+            pstate_writable: false,
+            cpu_max_perf_pct: saved_max_perf,
+            max_perf_presets: build_max_perf_presets(saved_max_perf),
+            max_perf_combo,
+            suppress_signals,
             check_performance,
             check_balanced,
             check_quiet,
         };
+        model.sync_max_perf_combo();
 
         let widgets = view_output!();
 
@@ -271,17 +407,38 @@ impl Component for FanModel {
         sender.command(move |out, shutdown| {
             shutdown
                 .register(async move {
+                    let startup_seq = MAX_PERF_APPLY_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
                     let available = dbus::check_asusd_available().await;
                     out.emit(FanCommandOutput::AsusdChecked(available));
 
                     if !available {
+                        let startup_max_perf = AppConfig::load()
+                            .active_profile()
+                            .cpu_max_perf_pct
+                            .map(clamp_perf_pct);
+                        if startup_max_perf.is_some()
+                            && MAX_PERF_APPLY_SEQ.load(Ordering::SeqCst) == startup_seq
+                            && let Ok(outcome) =
+                                cpu_tuning::apply_max_perf_pct(startup_max_perf, None).await
+                        {
+                            out.emit(FanCommandOutput::MaxPerfApplied {
+                                outcome,
+                                is_profile_load: true,
+                            });
+                            if let Ok(tel) =
+                                tokio::task::spawn_blocking(read_cpu_power_telemetry).await
+                            {
+                                out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                            }
+                        }
                         return;
                     }
 
                     // Re-read active profile after the async D-Bus probe in case
                     // `power_auto` activated a different profile during startup.
-                    let saved_profile =
-                        FanProfile::from(AppConfig::load().active_profile().fan_profile);
+                    let active = AppConfig::load().active_profile().clone();
+                    let saved_profile = FanProfile::from(active.fan_profile);
+                    let startup_max_perf = active.cpu_max_perf_pct.map(clamp_perf_pct);
 
                     match dbus::get_fan_profile().await {
                         Ok(current)
@@ -303,6 +460,24 @@ impl Component for FanModel {
                         Err(e) => {
                             out.emit(FanCommandOutput::Error(e));
                             return;
+                        }
+                    }
+
+                    if startup_max_perf.is_some() {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                        if MAX_PERF_APPLY_SEQ.load(Ordering::SeqCst) == startup_seq
+                            && let Ok(outcome) =
+                                cpu_tuning::apply_max_perf_pct(startup_max_perf, None).await
+                        {
+                            out.emit(FanCommandOutput::MaxPerfApplied {
+                                outcome,
+                                is_profile_load: true,
+                            });
+                            if let Ok(tel) =
+                                tokio::task::spawn_blocking(read_cpu_power_telemetry).await
+                            {
+                                out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                            }
                         }
                     }
 
@@ -385,10 +560,23 @@ impl Component for FanModel {
                         .drop_on_shutdown()
                 });
             }
-            FanMsg::LoadProfile(profile) => {
+            FanMsg::LoadProfile {
+                profile,
+                cpu_max_perf_pct,
+            } => {
                 self.current_profile = profile;
                 self.sync_radio_buttons(profile);
                 self.emit_state(&sender);
+
+                let target_max_perf = cpu_max_perf_pct.map(clamp_perf_pct);
+                let prev_max_perf = self.cpu_max_perf_pct;
+                if self.cpu_max_perf_pct != target_max_perf {
+                    self.cpu_max_perf_pct = target_max_perf;
+                    self.max_perf_presets = build_max_perf_presets(target_max_perf);
+                    self.sync_max_perf_combo();
+                }
+                self.spawn_apply_max_perf(target_max_perf, prev_max_perf, 450, true, &sender);
+
                 if !self.asusd_available {
                     return;
                 }
@@ -403,6 +591,18 @@ impl Component for FanModel {
                         })
                         .drop_on_shutdown()
                 });
+            }
+            FanMsg::SelectMaxPerf(idx) => {
+                let Some(&new_val) = self.max_perf_presets.get(idx as usize) else {
+                    return;
+                };
+                if new_val == self.cpu_max_perf_pct {
+                    return;
+                }
+                let prev_val = self.cpu_max_perf_pct;
+                self.cpu_max_perf_pct = new_val;
+                AppConfig::update(|c| c.active_profile_mut().cpu_max_perf_pct = new_val);
+                self.spawn_apply_max_perf(new_val, prev_val, 0, false, &sender);
             }
             FanMsg::RefreshTelemetry => {
                 sender.command(|out, shutdown| {
@@ -435,6 +635,9 @@ impl Component for FanModel {
                 self.current_profile = profile;
                 self.sync_radio_buttons(profile);
                 self.emit_state(&sender);
+                if self.cpu_max_perf_pct.is_none() {
+                    self.spawn_refresh_cpu_telemetry(&sender);
+                }
             }
             FanCommandOutput::ProfileSet(profile) => {
                 let name = match profile {
@@ -479,6 +682,29 @@ impl Component for FanModel {
                 }
                 self.spawn_refresh_cpu_telemetry(&sender);
             }
+            FanCommandOutput::MaxPerfApplied {
+                outcome,
+                is_profile_load,
+            } => match outcome {
+                ApplyMaxPerfOutcome::Applied(pct) => {
+                    if !is_profile_load {
+                        tracing::info!("{}", t!("fan_cpu_max_perf_set", pct = pct.to_string()));
+                    }
+                }
+                ApplyMaxPerfOutcome::PermissionDenied => {
+                    self.pstate_writable = false;
+                    if !is_profile_load {
+                        let _ = sender.output(FanOutput::Error(
+                            t!("fan_cpu_max_perf_permission_warning").to_string(),
+                        ));
+                    } else {
+                        tracing::debug!(
+                            "Skipping cpu_max_perf_pct apply on profile load: intel_pstate/max_perf_pct not writable"
+                        );
+                    }
+                }
+                ApplyMaxPerfOutcome::SkippedUnconfigured | ApplyMaxPerfOutcome::Unsupported => {}
+            },
             FanCommandOutput::CpuTelemetryRead(tel) => {
                 if let Some(summary) = format_cpu_telemetry(&tel) {
                     self.cpu_telemetry_subtitle = summary;
@@ -486,6 +712,8 @@ impl Component for FanModel {
                 } else {
                     self.cpu_telemetry_available = false;
                 }
+                self.max_perf_supported = tel.max_perf_pct.is_some();
+                self.pstate_writable = tel.pstate_writable;
             }
             FanCommandOutput::Error(e) => {
                 let _ = sender.output(FanOutput::Error(e));
@@ -507,10 +735,29 @@ mod tests {
             epp: Some("balance_performance".to_string()),
             governor: Some("powersave".to_string()),
             turbo_enabled: Some(true),
+            max_perf_pct: Some(80),
+            min_perf_pct: Some(13),
+            pstate_writable: true,
         };
         let formatted = format_cpu_telemetry(&populated).expect("should format telemetry");
         assert!(formatted.contains("balance_performance"));
         assert!(formatted.contains("powersave"));
         assert!(formatted.contains(&t!("fan_cpu_turbo_on").to_string()));
+        assert!(formatted.contains(&t!("fan_cpu_max_perf", pct = "80").to_string()));
+        // Normal low min_perf_pct (13%) should not clutter the summary
+        assert!(!formatted.contains("13%"));
+
+        // High min_perf_pct (>= 95%, e.g. tuned-ppd throughput-performance) should be surfaced
+        let high_min = CpuPowerTelemetry {
+            epp: Some("performance".to_string()),
+            governor: Some("performance".to_string()),
+            turbo_enabled: Some(true),
+            max_perf_pct: Some(100),
+            min_perf_pct: Some(100),
+            pstate_writable: false,
+        };
+        let formatted_high = format_cpu_telemetry(&high_min).expect("should format high min");
+        assert!(formatted_high.contains(&t!("fan_cpu_max_perf", pct = "100").to_string()));
+        assert!(formatted_high.contains(&t!("fan_cpu_min_perf_high", pct = "100").to_string()));
     }
 }

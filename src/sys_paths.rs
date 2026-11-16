@@ -30,6 +30,10 @@ pub const SYS_MEM_SLEEP: &str = "/sys/power/mem_sleep";
 pub const SYS_CPU_EPP: &str = "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference";
 pub const SYS_CPU_GOVERNOR: &str = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor";
 pub const SYS_INTEL_NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
+pub const SYS_INTEL_MAX_PERF_PCT: &str = "/sys/devices/system/cpu/intel_pstate/max_perf_pct";
+pub const SYS_INTEL_MIN_PERF_PCT: &str = "/sys/devices/system/cpu/intel_pstate/min_perf_pct";
+pub const MIN_SAFE_PERF_PCT: u8 = 30;
+pub const MAX_SAFE_PERF_PCT: u8 = 100;
 pub const SYS_ASUS_ARMOURY_ATTRS_DIR: &str =
     "/sys/class/firmware-attributes/asus-armoury/attributes";
 pub const SYS_DRM_DIR: &str = "/sys/class/drm";
@@ -380,6 +384,9 @@ pub struct CpuPowerTelemetry {
     pub epp: Option<String>,
     pub governor: Option<String>,
     pub turbo_enabled: Option<bool>,
+    pub max_perf_pct: Option<u8>,
+    pub min_perf_pct: Option<u8>,
+    pub pstate_writable: bool,
 }
 
 /// Parses `/sys/devices/system/cpu/intel_pstate/no_turbo` (`"0"` = enabled, `"1"` = disabled).
@@ -391,12 +398,25 @@ pub fn parse_no_turbo(raw: &str) -> Option<bool> {
     }
 }
 
-/// Reads read-only CPU EPP, governor, and `intel_pstate` Turbo Boost status from the live sysfs paths.
+/// Parses an `intel_pstate` `max_perf_pct` / `min_perf_pct` sysfs value (`0..=100`).
+pub fn parse_perf_pct(raw: &str) -> Option<u8> {
+    raw.trim().parse::<u8>().ok().filter(|&v| v <= 100)
+}
+
+/// Clamps an `intel_pstate` performance percentage to the safe `30..=100` guard range
+/// so the CPU cannot accidentally be pinned to unusable ultra-low frequencies (e.g. `8%`).
+pub fn clamp_perf_pct(val: u8) -> u8 {
+    val.clamp(MIN_SAFE_PERF_PCT, MAX_SAFE_PERF_PCT)
+}
+
+/// Reads read-only CPU EPP, governor, and `intel_pstate` telemetry from the live sysfs paths.
 pub fn read_cpu_power_telemetry() -> CpuPowerTelemetry {
     read_cpu_power_telemetry_in(
         Path::new(SYS_CPU_EPP),
         Path::new(SYS_CPU_GOVERNOR),
         Path::new(SYS_INTEL_NO_TURBO),
+        Path::new(SYS_INTEL_MAX_PERF_PCT),
+        Path::new(SYS_INTEL_MIN_PERF_PCT),
     )
 }
 
@@ -405,11 +425,16 @@ pub fn read_cpu_power_telemetry_in(
     epp_path: &Path,
     governor_path: &Path,
     no_turbo_path: &Path,
+    max_perf_pct_path: &Path,
+    min_perf_pct_path: &Path,
 ) -> CpuPowerTelemetry {
     CpuPowerTelemetry {
         epp: read_trimmed(epp_path),
         governor: read_trimmed(governor_path),
         turbo_enabled: read_trimmed(no_turbo_path).and_then(|s| parse_no_turbo(&s)),
+        max_perf_pct: read_trimmed(max_perf_pct_path).and_then(|s| parse_perf_pct(&s)),
+        min_perf_pct: read_trimmed(min_perf_pct_path).and_then(|s| parse_perf_pct(&s)),
+        pstate_writable: is_path_writable(max_perf_pct_path),
     }
 }
 
@@ -1016,26 +1041,53 @@ cpu1 71 0 89 118089 151 12 2 0 0 0
     }
 
     #[test]
+    fn test_parse_and_clamp_perf_pct() {
+        assert_eq!(parse_perf_pct("100\n"), Some(100));
+        assert_eq!(parse_perf_pct(" 65 \r\n"), Some(65));
+        assert_eq!(parse_perf_pct("0"), Some(0));
+        assert_eq!(parse_perf_pct("101"), None);
+        assert_eq!(parse_perf_pct("-1"), None);
+        assert_eq!(parse_perf_pct(""), None);
+
+        assert_eq!(clamp_perf_pct(0), 30);
+        assert_eq!(clamp_perf_pct(8), 30);
+        assert_eq!(clamp_perf_pct(30), 30);
+        assert_eq!(clamp_perf_pct(65), 65);
+        assert_eq!(clamp_perf_pct(100), 100);
+        assert_eq!(clamp_perf_pct(150), 100);
+    }
+
+    #[test]
     fn test_read_cpu_power_telemetry_in() {
         let mock = TempMockDir::new("cpu_tel");
         let epp = mock.path.join("epp");
         let gov = mock.path.join("gov");
         let no_turbo = mock.path.join("no_turbo");
+        let max_perf = mock.path.join("max_perf_pct");
+        let min_perf = mock.path.join("min_perf_pct");
         fs::write(&epp, "balance_performance\n").unwrap();
         fs::write(&gov, "powersave\n").unwrap();
         fs::write(&no_turbo, "0\n").unwrap();
+        fs::write(&max_perf, "80\n").unwrap();
+        fs::write(&min_perf, "13\n").unwrap();
 
-        let tel = read_cpu_power_telemetry_in(&epp, &gov, &no_turbo);
+        let tel = read_cpu_power_telemetry_in(&epp, &gov, &no_turbo, &max_perf, &min_perf);
         assert_eq!(tel.epp.as_deref(), Some("balance_performance"));
         assert_eq!(tel.governor.as_deref(), Some("powersave"));
         assert_eq!(tel.turbo_enabled, Some(true));
+        assert_eq!(tel.max_perf_pct, Some(80));
+        assert_eq!(tel.min_perf_pct, Some(13));
+        assert!(tel.pstate_writable);
 
         let missing = read_cpu_power_telemetry_in(
             &mock.path.join("missing_epp"),
             &mock.path.join("missing_gov"),
             &mock.path.join("missing_turbo"),
+            &mock.path.join("missing_max_perf"),
+            &mock.path.join("missing_min_perf"),
         );
         assert_eq!(missing, CpuPowerTelemetry::default());
+        assert!(!missing.pstate_writable);
     }
 
     #[test]

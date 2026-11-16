@@ -132,6 +132,9 @@ pub struct Profile {
     pub battery_deep_sleep_active: bool,
     pub gpu_mode: u32,
     pub apu_mem: i32,
+    /// Optional Intel P-State `max_perf_pct` ceiling (`None` = system default / 100%).
+    #[serde(default)]
+    pub cpu_max_perf_pct: Option<u8>,
 
     // Keyboard RGB (Aura)
     #[serde(default)]
@@ -215,6 +218,7 @@ impl Default for Profile {
             battery_deep_sleep_active: false,
             gpu_mode: 0,
             apu_mem: 0,
+            cpu_max_perf_pct: None,
             aura_mode: 0,
             aura_brightness: 2,
             aura_colour_r: 166,
@@ -430,6 +434,7 @@ mod tests {
         assert_eq!(profile.display_refresh_hz, None);
         assert_eq!(profile.gnome_screen_blank_secs, None);
         assert_eq!(profile.gnome_ambient_brightness, None);
+        assert_eq!(profile.cpu_max_perf_pct, None);
     }
 
     #[test]
@@ -440,6 +445,7 @@ mod tests {
             display_refresh_hz: Some(60),
             gnome_screen_blank_secs: Some(120),
             gnome_ambient_brightness: Some(true),
+            cpu_max_perf_pct: Some(65),
             ..Profile::default()
         };
 
@@ -448,6 +454,7 @@ mod tests {
         assert_eq!(parsed.display_refresh_hz, Some(60));
         assert_eq!(parsed.gnome_screen_blank_secs, Some(120));
         assert_eq!(parsed.gnome_ambient_brightness, Some(true));
+        assert_eq!(parsed.cpu_max_perf_pct, Some(65));
     }
 
     #[test]

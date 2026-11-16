@@ -123,6 +123,7 @@ struct HardwareSupportState {
     gpu_supported: Option<bool>,
     apu_mem_supported: Option<bool>,
     numberpad_supported: Option<bool>,
+    intel_pstate_max_perf_supported: bool,
     kde_available: bool,
     cosmic_available: bool,
     gnome_available: bool,
@@ -435,6 +436,9 @@ impl AppModel {
                 vis.hidden_title_keys.insert("oled_care_screen_blank_title");
                 vis.hidden_title_keys.insert("oled_care_ambient_brightness_title");
             }
+            if !self.hardware_support.intel_pstate_max_perf_supported {
+                vis.hidden_title_keys.insert("fan_cpu_max_perf_title");
+            }
 
             if let Some(current) = self.content_stack.visible_child_name()
                 && vis.hidden_pages.contains(current.as_str())
@@ -451,7 +455,10 @@ impl AppModel {
     /// `profile`. Grouped per page so the call sites stay readable.
     fn distribute_profile(&self, p: &crate::services::config::Profile) {
         // Display
-        self.fan.sender().emit(FanMsg::LoadProfile(FanProfile::from(p.fan_profile)));
+        self.fan.sender().emit(FanMsg::LoadProfile {
+            profile: FanProfile::from(p.fan_profile),
+            cpu_max_perf_pct: p.cpu_max_perf_pct,
+        });
         self.refresh_rate.sender().emit(RefreshRateMsg::LoadProfile(p.display_refresh_hz));
         self.oled_dimming.sender().emit(OledDimmingMsg::LoadProfile(p.oled_dc_dimming));
         self.target_mode.sender().emit(TargetModeMsg::LoadProfile(p.target_mode_active));
@@ -947,6 +954,10 @@ impl SimpleComponent for AppModel {
             gpu_supported: None,
             apu_mem_supported: None,
             numberpad_supported: None,
+            intel_pstate_max_perf_supported: std::path::Path::new(
+                crate::sys_paths::SYS_INTEL_MAX_PERF_PCT,
+            )
+            .exists(),
             kde_available: is_kde_desktop(),
             cosmic_available: is_cosmic_desktop(),
             gnome_available: is_gnome_desktop(),

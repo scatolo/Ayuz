@@ -401,6 +401,13 @@ static SEARCH_INDEX: &[SearchItem] = &[
         component_key: "fan",
     },
     SearchItem {
+        title_key: "fan_cpu_max_perf_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "fan",
+    },
+    SearchItem {
         title_key: "language_title",
         page_icon: "preferences-system-symbolic",
         page_title_key: "tab_system",
@@ -663,5 +670,42 @@ mod tests {
         assert!(!vis.is_item_visible("display", "oled_care", "oled_care_pixel_refresh_title"));
         assert!(vis.is_item_visible("display", "oled_care", "oled_care_screen_blank_title"));
         assert!(vis.is_visible("system", "diagnostics"));
+    }
+
+    fn extract_yaml_keys(raw: &str) -> HashSet<&str> {
+        raw.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    return None;
+                }
+                trimmed.split_once(':').map(|(k, _)| k.trim())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_locale_key_parity_and_search_index_keys() {
+        let en = extract_yaml_keys(include_str!("../locales/en.yml"));
+        let de = extract_yaml_keys(include_str!("../locales/de.yml"));
+        let it = extract_yaml_keys(include_str!("../locales/it.yml"));
+        let pt_br = extract_yaml_keys(include_str!("../locales/pt-br.yml"));
+
+        assert_eq!(en, de, "en.yml and de.yml key sets differ");
+        assert_eq!(en, it, "en.yml and it.yml key sets differ");
+        assert_eq!(en, pt_br, "en.yml and pt-br.yml key sets differ");
+
+        for item in SEARCH_INDEX {
+            assert!(
+                en.contains(item.title_key),
+                "SEARCH_INDEX title_key '{}' missing from locales/en.yml",
+                item.title_key
+            );
+            assert!(
+                en.contains(item.page_title_key),
+                "SEARCH_INDEX page_title_key '{}' missing from locales/en.yml",
+                item.page_title_key
+            );
+        }
     }
 }

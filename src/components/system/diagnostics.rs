@@ -27,6 +27,7 @@ use crate::services::{commands, dbus};
 use crate::sys_paths;
 
 const UINPUT_UDEV_FIX_CMD: &str = "echo 'KERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", OPTIONS+=\"static_node=uinput\"' | sudo tee /etc/udev/rules.d/99-ayuz-uinput.rules && sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput";
+const CPU_TMPFILES_FIX_CMD: &str = "echo 'z /sys/devices/system/cpu/intel_pstate/max_perf_pct 0664 root input -' | sudo tee /etc/tmpfiles.d/ayuz-cpu-tuning.conf && sudo systemd-tmpfiles --create /etc/tmpfiles.d/ayuz-cpu-tuning.conf";
 
 #[zbus::proxy(
     interface = "net.hadess.SensorProxy",
@@ -57,6 +58,8 @@ pub struct DiagnosticProbe {
     pub has_input_group: bool,
     pub can_read_input_events: bool,
     pub uinput_writable: bool,
+    pub intel_pstate_max_perf_present: bool,
+    pub intel_pstate_max_perf_writable: bool,
     pub playerctl_installed: bool,
     pub easyeffects_installed: bool,
     pub sensor_proxy_dbus_available: bool,
@@ -78,7 +81,7 @@ pub struct DiagnosticItem {
 
 /// Converts raw system probe flags into localized diagnostic rows and exact fix commands.
 pub fn build_diagnostic_items(probe: &DiagnosticProbe) -> Vec<DiagnosticItem> {
-    let mut items = Vec::with_capacity(6);
+    let mut items = Vec::with_capacity(7);
 
     items.push(DiagnosticItem {
         id: "asusd",
@@ -126,6 +129,21 @@ pub fn build_diagnostic_items(probe: &DiagnosticProbe) -> Vec<DiagnosticItem> {
         ok: probe.uinput_writable,
         fix_command: (!probe.uinput_writable).then(|| UINPUT_UDEV_FIX_CMD.to_string()),
     });
+
+    if probe.intel_pstate_max_perf_present {
+        items.push(DiagnosticItem {
+            id: "cpu-max-perf",
+            title: t!("diagnostics_item_cpu_max_perf").to_string(),
+            status_text: if probe.intel_pstate_max_perf_writable {
+                t!("diagnostics_status_writable").to_string()
+            } else {
+                t!("diagnostics_status_cpu_max_perf_denied").to_string()
+            },
+            ok: probe.intel_pstate_max_perf_writable,
+            fix_command: (!probe.intel_pstate_max_perf_writable)
+                .then(|| CPU_TMPFILES_FIX_CMD.to_string()),
+        });
+    }
 
     items.push(DiagnosticItem {
         id: "playerctl",
@@ -204,6 +222,10 @@ async fn run_probe() -> DiagnosticProbe {
         has_input_group: sys_paths::has_input_group(),
         can_read_input_events: sys_paths::can_read_any_input_event(),
         uinput_writable: sys_paths::is_path_writable(Path::new(sys_paths::DEV_UINPUT)),
+        intel_pstate_max_perf_present: Path::new(sys_paths::SYS_INTEL_MAX_PERF_PCT).exists(),
+        intel_pstate_max_perf_writable: sys_paths::is_path_writable(Path::new(
+            sys_paths::SYS_INTEL_MAX_PERF_PCT,
+        )),
         playerctl_installed,
         easyeffects_installed,
         sensor_proxy_dbus_available,
@@ -230,6 +252,8 @@ async fn run_probe() -> DiagnosticProbe {
         has_input_group: false,
         can_read_input_events: false,
         uinput_writable: false,
+        intel_pstate_max_perf_present: false,
+        intel_pstate_max_perf_writable: false,
         playerctl_installed,
         easyeffects_installed,
         sensor_proxy_dbus_available,
@@ -403,6 +427,30 @@ mod tests {
             has_input_group: true,
             can_read_input_events: true,
             uinput_writable: true,
+            intel_pstate_max_perf_present: true,
+            intel_pstate_max_perf_writable: true,
+            playerctl_installed: true,
+            easyeffects_installed: true,
+            sensor_proxy_dbus_available: true,
+            monitor_sensor_installed: true,
+            playerctl_install_cmd: "sudo dnf install playerctl".to_string(),
+            easyeffects_install_cmd: "sudo dnf install easyeffects".to_string(),
+            sensor_proxy_install_cmd: "sudo dnf install iio-sensor-proxy".to_string(),
+        };
+        let items = build_diagnostic_items(&probe);
+        assert_eq!(items.len(), 7);
+        assert!(items.iter().all(|item| item.ok && item.fix_command.is_none()));
+    }
+
+    #[test]
+    fn test_build_diagnostic_items_omits_cpu_max_perf_when_absent() {
+        let probe = DiagnosticProbe {
+            asusd_available: true,
+            has_input_group: true,
+            can_read_input_events: true,
+            uinput_writable: true,
+            intel_pstate_max_perf_present: false,
+            intel_pstate_max_perf_writable: false,
             playerctl_installed: true,
             easyeffects_installed: true,
             sensor_proxy_dbus_available: true,
@@ -413,7 +461,7 @@ mod tests {
         };
         let items = build_diagnostic_items(&probe);
         assert_eq!(items.len(), 6);
-        assert!(items.iter().all(|item| item.ok && item.fix_command.is_none()));
+        assert!(items.iter().all(|item| item.id != "cpu-max-perf"));
     }
 
     #[test]
@@ -423,6 +471,8 @@ mod tests {
             has_input_group: true,
             can_read_input_events: false,
             uinput_writable: false,
+            intel_pstate_max_perf_present: true,
+            intel_pstate_max_perf_writable: false,
             playerctl_installed: false,
             easyeffects_installed: false,
             sensor_proxy_dbus_available: false,
@@ -432,7 +482,7 @@ mod tests {
             sensor_proxy_install_cmd: "sudo dnf install iio-sensor-proxy".to_string(),
         };
         let items = build_diagnostic_items(&probe);
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 7);
         assert!(items.iter().all(|item| !item.ok));
 
         assert_eq!(
@@ -449,14 +499,18 @@ mod tests {
         );
         assert_eq!(
             items[3].fix_command.as_deref(),
-            Some("sudo dnf install playerctl")
+            Some(CPU_TMPFILES_FIX_CMD)
         );
         assert_eq!(
             items[4].fix_command.as_deref(),
-            Some("sudo dnf install easyeffects")
+            Some("sudo dnf install playerctl")
         );
         assert_eq!(
             items[5].fix_command.as_deref(),
+            Some("sudo dnf install easyeffects")
+        );
+        assert_eq!(
+            items[6].fix_command.as_deref(),
             Some("sudo systemctl enable --now iio-sensor-proxy")
         );
     }
@@ -468,6 +522,8 @@ mod tests {
             has_input_group: false,
             can_read_input_events: true,
             uinput_writable: true,
+            intel_pstate_max_perf_present: false,
+            intel_pstate_max_perf_writable: false,
             playerctl_installed: true,
             easyeffects_installed: true,
             sensor_proxy_dbus_available: true,
