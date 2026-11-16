@@ -84,9 +84,13 @@ jobs:
           echo "Resolved version=${VERSION}, tag=${TAG}, should_release=${SHOULD_RELEASE}"
 
   check:
-    name: Test & Clippy (Fedora 44)
+    name: Test & Clippy (Fedora ${{ matrix.fedora_version }})
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:44
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora_version: ["44", "45"]
+    container: quay.io/fedora/fedora:${{ matrix.fedora_version }}
     steps:
       - name: Install build dependencies
         run: |
@@ -106,6 +110,8 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: fedora-${{ matrix.fedora_version }}
 
       - name: Run unit tests
         run: cargo test --locked
@@ -114,18 +120,22 @@ jobs:
         run: cargo clippy --all-targets --locked
 
   build-rpm:
-    name: Build RPM (Fedora 44)
+    name: Build RPM (Fedora ${{ matrix.fedora_version }})
     needs: [prepare, check]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:44
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora_version: ["44", "45"]
+    container: quay.io/fedora/fedora:${{ matrix.fedora_version }}
     steps:
       - name: Install build dependencies
         run: |
           dnf -y install --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config \
             gtk4-devel libadwaita-devel gtk4-layer-shell-devel dbus-devel \
-            binutils git curl ca-certificates
+            binutils rpm-build git curl ca-certificates
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -138,6 +148,8 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: fedora-${{ matrix.fedora_version }}
 
       - name: Install cargo-generate-rpm
         run: cargo install --locked cargo-generate-rpm
@@ -151,15 +163,21 @@ jobs:
         shell: bash
         env:
           PKG_VERSION: ${{ needs.prepare.outputs.version }}
+          FEDORA_VERSION: ${{ matrix.fedora_version }}
         run: |
           RPM_VERSION="${PKG_VERSION//-/+}"
-          cargo generate-rpm -s "version = \"${RPM_VERSION}\""
+          cargo generate-rpm -s "version = \"${RPM_VERSION}\"" -s "release = \"1.fc${FEDORA_VERSION}\""
           ls -la target/generate-rpm/
+          rpm -qpR target/generate-rpm/*.rpm
+          if rpm -qpR target/generate-rpm/*.rpm | grep -q "libcbor"; then
+            echo "Error: unexpected transitive dependency libcbor found in RPM Requires" >&2
+            exit 1
+          fi
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: package-rpm
+          name: package-rpm-${{ matrix.fedora_version }}
           path: target/generate-rpm/*.rpm
           if-no-files-found: error
 

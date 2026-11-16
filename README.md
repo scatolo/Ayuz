@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>Tested on:</strong> ASUS Zenbook S16 · Fedora 43 · KDE Plasma &nbsp;|&nbsp; ASUS Zenbook 14 OLED (UX3405CA) · Fedora 44 · GNOME (Wayland)
+  <strong>Tested on:</strong> ASUS Zenbook S16 · Fedora 43 · KDE Plasma &nbsp;|&nbsp; ASUS Zenbook 14 OLED (UX3405CA) · Fedora 44 / 45 · GNOME (Wayland)
 </p>
 
 ---
@@ -124,7 +124,7 @@ Controls for the AniMatrix LED matrix display found on select ROG laptops (e.g. 
 | While Typing    | Palm rejection: suppress Smart Gestures and/or disable the touchpad entirely while typing, with a configurable reactivation delay (0.1-5 s) after the last keystroke | user in `input` group; KDE or GNOME for the touchpad option |
 | ASUS NumberPad  | Toggle the LED numeric keypad embedded in the touchpad. Emits standard Linux Numpad keycodes (`KEY_KP0`..`KEY_KPENTER`) through a virtual uinput device, so international keyboard layouts (e.g. German, Lithuanian) work natively. Includes a proportional 5×4 layout (`UX3405`, `UM3402`, `B3302`) alongside the universal 4×4 grid. | Physical NumberPad LED hardware + `i2c-dev` & `uinput` kernel modules; user in `i2c` and `input` groups (see below) |
 
-> **GNOME Wayland Smart Gestures:** On GNOME Wayland (e.g. Fedora 44), Smart Gestures work natively without `pactl` or root permissions on `brightnessctl`: volume uses **PipeWire (`wpctl`)** (falling back to `pactl`), and brightness uses **Mutter / GNOME Settings Daemon D-Bus** (`org.gnome.Mutter.DisplayConfig` on GNOME 47+ Wayland, with `org.gnome.SettingsDaemon.Power.Screen` and `brightnessctl` as fallbacks).
+> **GNOME Wayland Smart Gestures:** On GNOME Wayland (e.g. Fedora 44 / 45), Smart Gestures work natively without `pactl` or root permissions on `brightnessctl`: volume uses **PipeWire (`wpctl`)** (falling back to `pactl`), and brightness uses **Mutter / GNOME Settings Daemon D-Bus** (`org.gnome.Mutter.DisplayConfig` on GNOME 47+ Wayland, with `org.gnome.SettingsDaemon.Power.Screen` and `brightnessctl` as fallbacks).
 
 > **ASUS Zenbook 14 OLED (UX3405CA) & Touchpad-only SKUs:** Some UX3405CA configurations have a plain trackpad with **no physical or digital NumberPad LED grid**, even though the touchpad controller (`ASUP*`) exposes an I2C bus.
 > - If your laptop **does not** have a physical NumberPad on the trackpad: you only need the `input` group (`sudo usermod -aG input $USER`) for **Smart Gestures** and **While Typing**. You do **not** need the `i2c` group or `i2c-dev`; any `/dev/i2c-*` warning shown in the NumberPad section is harmless and does not affect Smart Gestures.
@@ -226,7 +226,7 @@ Ayuz integrates with several external tools and system services. Install only th
 The application has been developed and tested on:
 
 - **ASUS Zenbook S16** · Fedora 43 · KDE Plasma (Wayland) *(upstream)*
-- **ASUS Zenbook 14 OLED (UX3405CA)** · Fedora 44 · GNOME (Wayland) *(UX3405 porting/patch)*
+- **ASUS Zenbook 14 OLED (UX3405CA)** · Fedora 44 / 45 · GNOME (Wayland) *(UX3405 porting/patch)*
 
 Other ASUS laptops are likely supported to varying degrees. Features relying on `asusd` (battery, fan, FN key) depend on your device being supported by asusctl. Check the [asusctl device support list](https://gitlab.com/asus-linux/asusctl) for compatibility. <br>
 Other Linux distributions should work as long as the relevant dependencies can be installed. Features are individually guarded against missing tools, so the app remains usable even if only some dependencies are available.
@@ -247,23 +247,26 @@ On all other models the AniMatrix section is shown as grayed out.
 
 ## Installation
 
-### Quick Install (UX3405CA / Fedora 44 GNOME Fork)
+### Quick Install (UX3405CA / Fedora 44 & 45 GNOME Fork)
 
 Pre-built **`.rpm`**, **`.deb`**, and **`.AppImage`** packages for this porting are automatically published on the [fork's GitHub Releases](https://github.com/scatolo/Ayuz/releases).
 
 1. **Download & install the package for your distribution:**
-   - **Fedora / RPM-based:**
+   - **Fedora 44 / 45 (RPM):**
      ```bash
-     sudo dnf install ./ayuz-1.1.10+ux3405.1-1.x86_64.rpm
+     # Fedora 44:
+     sudo dnf install ./ayuz-1.2.1-1.fc44.x86_64.rpm
+     # Fedora 45:
+     sudo dnf install ./ayuz-1.2.1-1.fc45.x86_64.rpm
      ```
    - **Debian / Ubuntu / DEB-based:**
      ```bash
-     sudo apt install ./ayuz_1.1.10+ux3405.1-1_amd64.deb
+     sudo apt install ./ayuz_1.2.1-1_amd64.deb
      ```
    - **AppImage (any distribution):**
      ```bash
-     chmod +x ayuz-1.1.10-ux3405.1-x86_64.AppImage
-     ./ayuz-1.1.10-ux3405.1-x86_64.AppImage
+     chmod +x ayuz-1.2.1-x86_64.AppImage
+     ./ayuz-1.2.1-x86_64.AppImage
      ```
 
 2. **Enable permissions for Touchpad Smart Gestures & While Typing:**
@@ -273,7 +276,7 @@ Pre-built **`.rpm`**, **`.deb`**, and **`.AppImage`** packages for this porting 
    Log out and back in (or reboot) for group membership to take effect.
    *(Only add `,i2c` — i.e. `sudo usermod -aG i2c,input $USER` — if your laptop physically has the illuminated NumberPad LED grid on the trackpad.)*
 
-3. **Optional runtime tools on Fedora 44 GNOME:**
+3. **Optional runtime tools on Fedora 44 / 45 GNOME:**
    `wpctl` (PipeWire) and GNOME Mutter D-Bus brightness work out of the box. Install optional tools for extra features:
    ```bash
    # Battery care (80% limit), fan profiles, FN key mode:
@@ -403,22 +406,25 @@ sudo dnf install easyeffects iio-sensor-proxy swayidle brightnessctl playerctl
 
 Download the package matching your distribution from this fork's [GitHub Releases](https://github.com/scatolo/Ayuz/releases) page (or upstream [Traciges/Ayuz](https://github.com/Traciges/Ayuz/releases) for standard releases):
 
-- **Fedora / RPM-based:**
+- **Fedora 44 / 45 (RPM):**
 
   ```bash
-  sudo dnf install ./ayuz-1.1.10+ux3405.1-1.x86_64.rpm
+  # Fedora 44:
+  sudo dnf install ./ayuz-1.2.1-1.fc44.x86_64.rpm
+  # Fedora 45:
+  sudo dnf install ./ayuz-1.2.1-1.fc45.x86_64.rpm
   ```
 
 - **Debian / Ubuntu / DEB-based:**
 
   ```bash
-  sudo apt install ./ayuz_1.1.10+ux3405.1-1_amd64.deb
+  sudo apt install ./ayuz_1.2.1-1_amd64.deb
   ```
 
 - **AppImage (any distribution):**
   ```bash
-  chmod +x ayuz-1.1.10-ux3405.1-x86_64.AppImage
-  ./ayuz-1.1.10-ux3405.1-x86_64.AppImage
+  chmod +x ayuz-1.2.1-x86_64.AppImage
+  ./ayuz-1.2.1-x86_64.AppImage
   ```
 
 **Note for AppImage users:** Because the AppImage runs without root privileges, it cannot install the necessary hardware permissions for the ASUS NumberPad automatically. If you want to use the NumberPad feature, please follow the manual `udev` rules installation in the NumberPad Requirements section above.

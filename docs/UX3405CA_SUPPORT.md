@@ -1,12 +1,12 @@
-# ASUS Zenbook 14 OLED (UX3405CA) & Fedora 44 GNOME Wayland Support
+# ASUS Zenbook 14 OLED (UX3405CA) & Fedora 44 / 45 GNOME Wayland Support
 
-Technical reference for the `scatolo/Ayuz` fork (`1.1.10-ux3405.1`), documenting how Ayuz adapts to **ASUS Zenbook 14 OLED (UX3405CA)** on **Fedora 44 · GNOME (Wayland)** and how automated releases are built.
+Technical reference for the `scatolo/Ayuz` fork (`1.2.1`), documenting how Ayuz adapts to **ASUS Zenbook 14 OLED (UX3405CA)** on **Fedora 44 / 45 · GNOME (Wayland)** (GNOME 48–51) and how automated releases are built.
 
 ---
 
-## 1. Feature & Compatibility Matrix (UX3405CA · Fedora 44 GNOME Wayland)
+## 1. Feature & Compatibility Matrix (UX3405CA · Fedora 44 / 45 GNOME Wayland)
 
-| Page | Feature | Status on UX3405CA / Fedora 44 GNOME | Backend / Notes |
+| Page | Feature | Status on UX3405CA / Fedora 44–45 GNOME | Backend / Notes |
 | --- | --- | --- | --- |
 | **Home** | Device info & telemetry | Supported | Dynamic sysfs discovery in `src/sys_paths.rs`; serial reveal uses `pkexec cat` |
 | **Home** | Profiles | Supported | Persisted in `~/.config/ayuz/config.json` |
@@ -26,7 +26,7 @@ Technical reference for the `scatolo/Ayuz` fork (`1.1.10-ux3405.1`), documenting
 | **Touchpad** | While Typing | Supported | `disable_gestures` requires `input` group (`typing_watch.rs`); `disable_touchpad` also uses `gsettings` (`touchpad_ctl.rs`) |
 | **Touchpad** | NumberPad | **SKU-dependent** | Maintainer's UX3405CA SKU has no physical/digital NumberPad LEDs; `UX3405` DMI override (`UX3405MA_5X4` 5×4) applies if LED hardware is present |
 | **Audio** | Volume & Boost (0–150%) | Supported | Reads/sets `@DEFAULT_AUDIO_SINK@` via `wpctl`; optional `pactl subscribe` for live external-change UI sync |
-| **Audio** | Sound Profiles | Optional | Requires `easyeffects`; extracts bundled presets from `assets/presets/` |
+| **Audio** | Sound Profiles | Optional | Requires `easyeffects`; auto-detects EasyEffects 7.x (`~/.config/easyeffects/output` + `--gapplication-service` on Fedora 44) vs 8.x (`$XDG_DATA_HOME/easyeffects/output` / `~/.local/share/easyeffects/output` + `--service-mode` on Fedora 45) |
 | **System** | Battery Care & Fan Profiles | Optional | Requires `asusd` (`xyz.ljones.Asusd` / `xyz.ljones.Platform`) |
 | **System** | Deep Sleep (`s2idle` / `deep`) | Firmware-dependent | Reads `/sys/power/mem_sleep` directly (enabled only if `deep` is advertised); writes via `pkexec tee` |
 | **System** | GPU Mode / APU Mem | Optional / Hardware-dependent | `supergfxd` (`org.supergfxctl.Daemon`) / `asusd` (`xyz.ljones.AsusArmoury`) |
@@ -45,7 +45,7 @@ Technical reference for the `scatolo/Ayuz` fork (`1.1.10-ux3405.1`), documenting
 - **Left edge (Volume)**: `adjust_volume()` checks `/usr/bin/wpctl` (or `wpctl` on `$PATH`) via `OnceLock` and uses PipeWire (`wpctl set-mute` / `set-volume @DEFAULT_AUDIO_SINK@ 5%+/-`), falling back to `pactl`.
 - **Right edge (Screen Brightness)**: When `is_gnome_desktop()` is true, `gnome_brightness::adjust_brightness_relative(delta)` runs on the session D-Bus:
   1. Tries `org.gnome.SettingsDaemon.Power.Screen` (`StepUp` / `StepDown`, then `Brightness` property).
-  2. Falls back to `org.gnome.Mutter.DisplayConfig` (`Backlight` property + `SetBacklight(serial, connector, next)`), which handles GNOME 47+ Wayland (including Fedora 44). `calculate_next_backlight()` computes a proportional step across the hardware span (e.g., `4..496` on UX3405CA) with a minimum 1-unit change when `delta_percent != 0`.
+  2. Falls back to `org.gnome.Mutter.DisplayConfig` (`Backlight` property + `SetBacklight(serial, connector, next)`), which handles GNOME 47+ Wayland (including Fedora 44 / 45). `calculate_next_backlight()` computes a proportional step across the hardware span (e.g., `4..496` on UX3405CA) with a minimum 1-unit change when `delta_percent != 0`.
   3. Falls back to `brightnessctl set 5%+/-` if D-Bus calls fail.
 - **Top edge (Media)**: Calls `playerctl previous` / `playerctl next`.
 - **UI gating (`src/components/touchpad/gestures.rs`)**: `brightnessctl_available` is treated as satisfied when `is_gnome_desktop() || is_kde_desktop() || which_exists("brightnessctl")`, so GNOME Wayland users do not need `brightnessctl` installed to enable Smart Gestures (only `playerctl` is checked as a CLI dependency, plus the `input` group at runtime to read `/dev/input/event*`).
@@ -67,11 +67,11 @@ Every push to `main`, push of a `v*` tag, or manual `workflow_dispatch` runs:
    - On tag push: always releases.
    - On `main` push: releases if tag `v<version>` does not yet exist on `origin`.
    - On `workflow_dispatch`: releases if `force_release == true`, tag is missing, or GitHub Release is missing.
-2. **`check`** (`quay.io/fedora/fedora:44`): Installs GTK4/Libadwaita/LayerShell/D-Bus devel packages + Rust stable (`clippy`) and runs:
+2. **`check`** (`quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45` matrix): Installs GTK4/Libadwaita/LayerShell/D-Bus devel packages + Rust stable (`clippy`) and runs:
    - `cargo test --locked`
    - `cargo clippy --all-targets --locked`
 3. **Package builds** (gated on `should_release == 'true'` and `check`):
-   - `build-rpm` (`quay.io/fedora/fedora:44`): `cargo build --release --locked`, `strip -s target/release/ayuz`, `cargo generate-rpm -s "version = \"${PKG_VERSION//-/+}\""`
+   - `build-rpm` (`quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45` matrix): Installs `rpm-build` so `cargo-generate-rpm` uses `/usr/lib/rpm/find-requires` (direct `DT_NEEDED` dependencies instead of transitive `ldd` fallback), runs `cargo build --release --locked`, `strip -s target/release/ayuz`, `cargo generate-rpm -s "version = \"${PKG_VERSION//-/+}\"" -s "release = \"1.fc${FEDORA_VERSION}\""`, and verifies via `rpm -qpR` that `libcbor` is absent from `Requires`.
    - `build-deb` (`ubuntu:26.04`): `cargo build --release --locked`, `cargo deb --no-build --deb-version "${PKG_VERSION//-/+}-1"`
    - `build-appimage` (`ubuntu:26.04`): `cargo build --release --locked`, `VERSION="${PKG_VERSION}" ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 cargo appimage`
-4. **`release`**: Downloads all three artifacts and creates/updates the GitHub Release and tag via `softprops/action-gh-release@v2`.
+4. **`release`**: Downloads all four artifacts (`fc44` RPM, `fc45` RPM, DEB, AppImage) and creates/updates the GitHub Release and tag via `softprops/action-gh-release@v2`.

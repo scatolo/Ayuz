@@ -6,8 +6,8 @@ Repository guidance for coding agents and contributors working on **Ayuz** (`sca
 
 ## 1. Fork Identity & Target Scope
 
-- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.1.13` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
-- **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 · GNOME (Wayland)**.
+- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.2.1` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
+- **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 / 45 · GNOME (Wayland)**.
 - **Upstream Target Retained**: **ASUS Zenbook S16** running **Fedora 43 · KDE Plasma (Wayland)** (and COSMIC where supported).
 - **Explicit Scope Boundaries**:
   - **Display Color Gamut switching** (`src/components/display/color_gamut.rs`) is KDE-only (`is_kde_desktop()` / `kscreen-doctor`) and is **explicitly out of scope** for GNOME / UX3405CA. Do not add GNOME/Mutter ICC/gamut switching unless explicitly requested.
@@ -21,14 +21,14 @@ Supporting hardware/OS details and the UX3405CA compatibility matrix live in [do
 
 ### System Build Dependencies
 
-- **Fedora 44** (used by CI `check` and `build-rpm`):
+- **Fedora 44 / 45** (used by CI `check` and `build-rpm`):
   ```bash
   sudo dnf install -y \
     gcc pkgconf-pkg-config \
     gtk4-devel libadwaita-devel gtk4-layer-shell-devel dbus-devel \
-    binutils
+    binutils rpm-build
   ```
-  (`binutils` provides `strip` for RPM builds.)
+  (`binutils` provides `strip` and `rpm-build` provides `/usr/lib/rpm/find-requires` for RPM builds so `cargo-generate-rpm` records direct `DT_NEEDED` dependencies instead of transitive `ldd` libraries.)
 - **Ubuntu / Debian** (used by CI `build-deb` and `build-appimage` on `ubuntu:26.04`):
   ```bash
   sudo apt-get install -y \
@@ -43,7 +43,7 @@ Supporting hardware/OS details and the UX3405CA compatibility matrix live in [do
 # Run headless unit tests (must pass without a Wayland/X11 display, D-Bus, or ASUS hardware)
 cargo test --locked
 
-# Lint all targets (CI runs clippy on Fedora 44)
+# Lint all targets (CI runs clippy on Fedora 44 and 45)
 cargo clippy --all-targets --locked
 
 # Build release binary
@@ -59,14 +59,16 @@ cargo run --locked -- --toggle-numberpad
 
 CI workflow `.github/workflows/release.yml` runs on pushes to `main`, tags matching `v*`, or manual `workflow_dispatch` (optional `force_release` boolean):
 
-- **`prepare` & `check`** (run on every trigger; `check` runs in `quay.io/fedora/fedora:44`): `cargo test --locked` and `cargo clippy --all-targets --locked`.
+- **`prepare` & `check`** (run on every trigger; `check` runs as a matrix across `quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45`): `cargo test --locked` and `cargo clippy --all-targets --locked`.
 - **`build-rpm`**, **`build-deb`**, **`build-appimage`**, and **`release`** only run when `check` passes and `should_release == 'true'` (new tag, new version on `main`, or `workflow_dispatch` with missing tag/release or `force_release=true`):
-  - **RPM** (`quay.io/fedora/fedora:44`, `cargo-generate-rpm`):
+  - **RPM** (`quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45` matrix, `rpm-build` + `cargo-generate-rpm`):
     ```bash
-    PKG_VERSION="1.1.10-ux3405.1"      # must match Cargo.toml [package].version
-    RPM_VERSION="${PKG_VERSION//-/+}"  # e.g. 1.1.10+ux3405.1
+    PKG_VERSION="1.2.1"                # must match Cargo.toml [package].version
+    RPM_VERSION="${PKG_VERSION//-/+}"  # e.g. 1.2.1
+    FEDORA_VERSION="45"                # 44 or 45 in CI matrix
     cargo build --release --locked && strip -s target/release/ayuz
-    cargo generate-rpm -s "version = \"${RPM_VERSION}\""
+    cargo generate-rpm -s "version = \"${RPM_VERSION}\"" -s "release = \"1.fc${FEDORA_VERSION}\""
+    rpm -qpR target/generate-rpm/*.rpm
     ```
   - **DEB** (`ubuntu:26.04`, `cargo-deb`):
     ```bash
@@ -125,7 +127,7 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
 | `src/components/keyboard/` | `auto_backlight.rs` (`iio-sensor-proxy` + `logind` lock check), `backlight_idle.rs` (`swayidle` + UPower D-Bus), `fn_key.rs` (`pkexec grubby` `asus_wmi.fnlock_default`). |
 | `src/components/aura/`, `animatrix/` | Dynamic `asusd` Aura RGB device pages (`aura_page.rs`, `aura_device.rs`) and AniMatrix LED matrix controls + GIF gallery (`animatrix.rs`). |
 | `src/components/touchpad/` | `touchpad.rs` (10s auto-revert safety timer), `numberpad.rs`, `gestures.rs` (requires `playerctl`; brightness gate satisfied on GNOME/KDE or `brightnessctl`), `typing.rs`. |
-| `src/components/audio/`, `system/` | `volume.rs` (`wpctl` + `pactl subscribe` with `wpctl` polling fallback), `sound_modes.rs` (`easyeffects`), `battery.rs` (`asusd` charge limit + `/sys/power/mem_sleep`), `fan.rs` + `fan_osd.rs` (`gtk4-layer-shell` with regular window fallback), `gpu.rs` (`supergfxctl`), `apu_mem.rs` (`asusd`). |
+| `src/components/audio/`, `system/` | `volume.rs` (`wpctl` + `pactl subscribe` with `wpctl` polling fallback), `sound_modes.rs` (`easyeffects`, auto-detecting 7.x vs 8.x preset dirs and service flags), `battery.rs` (`asusd` charge limit + `/sys/power/mem_sleep`), `fan.rs` + `fan_osd.rs` (`gtk4-layer-shell` with regular window fallback), `gpu.rs` (`supergfxctl`), `apu_mem.rs` (`asusd`). |
 | `locales/` | `en.yml`, `de.yml`, `pt-br.yml` (`rust-i18n`, fallback `"en"`). |
 | `packaging/`, `.github/workflows/` | `.desktop` files, AppStream metainfo (`de.guido.ayuz.metainfo.xml`), `udev/99-ayuz-numberpad.rules`, `release.yml`, plus root `dist-workspace.toml` and `flake.nix`. |
 | `assets/` | `style.css`, `trayicon.png`, `img/`, `icm/`, `presets/` (EasyEffects), `anime/` (AniMatrix GIFs/images). |
@@ -146,5 +148,5 @@ Note: `Cargo.toml` `[package].repository`, the sidebar GitHub button in `src/app
    - Emit `LoadProfile` in `AppModel::distribute_profile` (`src/app.rs`).
    - Add widget to `widget_map` in `src/app.rs` and to `SEARCH_INDEX` in `src/search.rs`.
    - Add translation keys to **all three** files: `locales/en.yml`, `locales/de.yml`, and `locales/pt-br.yml`.
-9. **Headless unit tests**: CI runs `cargo test --locked` inside `quay.io/fedora/fedora:44` with no display server, no D-Bus session/system services, and no ASUS hardware. Keep unit tests decoupled from live `/sys`, `/dev`, D-Bus, and GTK display initialization (follow the mock-directory pattern in `src/sys_paths.rs` and pure-function tests in `src/services/gnome_brightness.rs`, `src/services/edge_gestures.rs`, and `src/services/numberpad_layouts.rs`).
+9. **Headless unit tests**: CI runs `cargo test --locked` inside `quay.io/fedora/fedora:44` and `quay.io/fedora/fedora:45` with no display server, no D-Bus session/system services, and no ASUS hardware. Keep unit tests decoupled from live `/sys`, `/dev`, D-Bus, and GTK display initialization (follow the mock-directory pattern in `src/sys_paths.rs` and pure-function tests in `src/services/gnome_brightness.rs`, `src/services/edge_gestures.rs`, and `src/services/numberpad_layouts.rs`).
 10. **End-of-session Git commands**: Whenever a session modifies repository files, end the final response with ready-to-run, clean `git add`, `git commit`, and `git push` commands (scoping `git add` explicitly to the modified files and suggesting a clear, concise commit message).
