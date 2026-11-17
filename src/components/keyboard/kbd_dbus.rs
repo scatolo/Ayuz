@@ -125,31 +125,37 @@ pub(super) trait MutterDisplayPower {
     fn power_save_mode(&self) -> zbus::Result<i32>;
 }
 
-#[zbus::proxy(
-    interface = "org.gnome.ScreenSaver",
-    default_service = "org.gnome.ScreenSaver",
-    default_path = "/org/gnome/ScreenSaver"
-)]
-pub(super) trait GnomeScreenSaver {
-    #[zbus(name = "GetActive")]
-    fn get_active(&self) -> zbus::Result<bool>;
+pub(crate) mod gnome_screensaver {
+    #[zbus::proxy(
+        interface = "org.gnome.ScreenSaver",
+        default_service = "org.gnome.ScreenSaver",
+        default_path = "/org/gnome/ScreenSaver"
+    )]
+    pub(crate) trait GnomeScreenSaver {
+        #[zbus(name = "GetActive")]
+        fn get_active(&self) -> zbus::Result<bool>;
 
-    #[zbus(signal, name = "ActiveChanged")]
-    fn active_changed(&self, new_value: bool) -> zbus::Result<()>;
+        #[zbus(signal, name = "ActiveChanged")]
+        fn active_changed(&self, new_value: bool) -> zbus::Result<()>;
+    }
 }
+pub(super) use gnome_screensaver::GnomeScreenSaverProxy;
 
-#[zbus::proxy(
-    interface = "org.freedesktop.ScreenSaver",
-    default_service = "org.freedesktop.ScreenSaver",
-    default_path = "/org/freedesktop/ScreenSaver"
-)]
-pub(super) trait FdoScreenSaver {
-    #[zbus(name = "GetActive")]
-    fn get_active(&self) -> zbus::Result<bool>;
+pub(crate) mod fdo_screensaver {
+    #[zbus::proxy(
+        interface = "org.freedesktop.ScreenSaver",
+        default_service = "org.freedesktop.ScreenSaver",
+        default_path = "/org/freedesktop/ScreenSaver"
+    )]
+    pub(crate) trait FdoScreenSaver {
+        #[zbus(name = "GetActive")]
+        fn get_active(&self) -> zbus::Result<bool>;
 
-    #[zbus(signal, name = "ActiveChanged")]
-    fn active_changed(&self, new_value: bool) -> zbus::Result<()>;
+        #[zbus(signal, name = "ActiveChanged")]
+        fn active_changed(&self, new_value: bool) -> zbus::Result<()>;
+    }
 }
+pub(super) use fdo_screensaver::FdoScreenSaverProxy;
 
 /// Queries the maximum keyboard backlight level from `org.freedesktop.UPower.KbdBacklight`.
 ///

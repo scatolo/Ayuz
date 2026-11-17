@@ -19,6 +19,9 @@ Supporting hardware/OS details and the UX3405CA compatibility matrix live in [do
 
 ## 2. Build, Test, Lint, and Packaging Commands
 
+> [!IMPORTANT]
+> **No local Rust/build toolchain**: This host intentionally has **no** `cargo`, `rustc`, C/GTK `-devel` headers, or local build containers (`toolbox`/`podman` build images), and the user does **not** want them installed locally. **Do NOT run or probe for `cargo`, `rustc`, `clippy`, `toolbox`, or `podman` builds** — compilation, unit tests (`cargo test --locked`), and linting (`cargo clippy --all-targets --locked`) are verified exclusively via GitHub Actions CI (`.github/workflows/release.yml`). Review code carefully by static inspection and state explicitly that CI will run build/tests after push.
+
 ### System Build Dependencies
 
 - **Fedora 44 / 45** (used by CI `check` and `build-rpm`):
