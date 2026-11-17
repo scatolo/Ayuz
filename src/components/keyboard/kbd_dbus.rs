@@ -15,10 +15,22 @@
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sys_paths::SYS_POWER_SUPPLY_DIR;
 
-#[derive(Debug, Clone, Copy)]
+/// Shared flag set while [`super::backlight_idle`] has dimmed the keyboard due to user inactivity.
+static KBD_IDLE_DIMMED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_kbd_idle_dimmed(dimmed: bool) {
+    KBD_IDLE_DIMMED.store(dimmed, Ordering::Relaxed);
+}
+
+pub(super) fn is_kbd_idle_dimmed() -> bool {
+    KBD_IDLE_DIMMED.load(Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct AmbientRules {
     pub auto_brighten: bool,
     pub brighten_threshold: f64,
@@ -40,6 +52,9 @@ pub(super) trait KbdBacklight {
 
     #[zbus(name = "SetBrightness")]
     fn set_brightness(&self, value: i32) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "BrightnessChanged")]
+    fn brightness_changed(&self, value: i32) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -64,6 +79,76 @@ pub(super) trait SensorProxy {
 pub(super) trait UPower {
     #[zbus(property, name = "OnBattery")]
     fn on_battery(&self) -> zbus::Result<bool>;
+
+    #[zbus(property, name = "LidIsClosed")]
+    fn lid_is_closed(&self) -> zbus::Result<bool>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1"
+)]
+pub(super) trait LogindManager {
+    fn get_session(&self, session_id: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn get_session_by_pid(&self, pid: u32) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+
+    #[zbus(property, name = "PreparingForSleep")]
+    fn preparing_for_sleep(&self) -> zbus::Result<bool>;
+
+    #[zbus(signal, name = "PrepareForSleep")]
+    fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1"
+)]
+pub(super) trait LogindSession {
+    #[zbus(property, name = "LockedHint")]
+    fn locked_hint(&self) -> zbus::Result<bool>;
+
+    #[zbus(property, name = "IdleHint")]
+    fn idle_hint(&self) -> zbus::Result<bool>;
+
+    #[zbus(property, name = "Active")]
+    fn active(&self) -> zbus::Result<bool>;
+}
+
+#[zbus::proxy(
+    interface = "org.gnome.Mutter.DisplayConfig",
+    default_service = "org.gnome.Mutter.DisplayConfig",
+    default_path = "/org/gnome/Mutter/DisplayConfig"
+)]
+pub(super) trait MutterDisplayPower {
+    #[zbus(property, name = "PowerSaveMode")]
+    fn power_save_mode(&self) -> zbus::Result<i32>;
+}
+
+#[zbus::proxy(
+    interface = "org.gnome.ScreenSaver",
+    default_service = "org.gnome.ScreenSaver",
+    default_path = "/org/gnome/ScreenSaver"
+)]
+pub(super) trait GnomeScreenSaver {
+    #[zbus(name = "GetActive")]
+    fn get_active(&self) -> zbus::Result<bool>;
+
+    #[zbus(signal, name = "ActiveChanged")]
+    fn active_changed(&self, new_value: bool) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.ScreenSaver",
+    default_service = "org.freedesktop.ScreenSaver",
+    default_path = "/org/freedesktop/ScreenSaver"
+)]
+pub(super) trait FdoScreenSaver {
+    #[zbus(name = "GetActive")]
+    fn get_active(&self) -> zbus::Result<bool>;
+
+    #[zbus(signal, name = "ActiveChanged")]
+    fn active_changed(&self, new_value: bool) -> zbus::Result<()>;
 }
 
 /// Queries the maximum keyboard backlight level from `org.freedesktop.UPower.KbdBacklight`.

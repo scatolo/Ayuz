@@ -24,6 +24,7 @@ use tokio::sync::watch;
 
 use super::kbd_dbus::{
     AmbientRules, KbdBacklightProxy, get_kbd_max_brightness, is_on_battery, read_ambient_lux,
+    set_kbd_idle_dimmed,
 };
 use crate::services::commands::is_gnome_desktop;
 use crate::services::config::AppConfig;
@@ -73,13 +74,13 @@ const TIMEOUT_SECONDS: [u32; 3] = [60, 120, 300];
 
 /// Wraps a shell command so it only runs while on battery power.
 ///
-/// When `battery_only` is `true`, `base` is guarded by a conditional that reads the first
-/// `online` sysfs file and skips execution when the device is plugged in to AC power. The
-/// guard tolerates a multi-statement `base` (statements separated by `;`).
+/// When `battery_only` is `true`, `base` is guarded by a conditional that checks whether any
+/// power supply reports `online = 1`, skipping execution when the device is plugged in to AC
+/// or USB-C PD power. The guard tolerates a multi-statement `base` (statements separated by `;`).
 fn battery_guard(base: &str, battery_only: bool) -> String {
     if battery_only {
         format!(
-            "if [ \"$(cat /sys/class/power_supply/*/online | head -n1)\" = \"0\" ]; \
+            "if ! grep -qx 1 /sys/class/power_supply/*/online 2>/dev/null; \
              then {base}; fi"
         )
     } else {
@@ -179,6 +180,7 @@ pub struct BacklightIdleModel {
     dropdown_battery_and_ac: gtk::DropDown,
     dropdown_battery_only: gtk::DropDown,
     idle_stop_tx: Option<watch::Sender<bool>>,
+    rules_tx: Option<watch::Sender<AmbientRules>>,
 }
 
 #[derive(Debug)]
@@ -311,6 +313,7 @@ impl Component for BacklightIdleModel {
             dropdown_battery_and_ac,
             dropdown_battery_only,
             idle_stop_tx: None,
+            rules_tx: None,
         };
 
         let widgets = view_output!();
@@ -370,6 +373,24 @@ impl Component for BacklightIdleModel {
                 self.apply_timeout(timeout_mode, &sender);
             }
             BacklightIdleMsg::AmbientChanged => {
+                if self.timeout_mode == TimeoutMode::Never {
+                    return;
+                }
+                if is_gnome_desktop()
+                    && let Some(tx) = &self.rules_tx
+                {
+                    let config = AppConfig::load();
+                    let p = config.active_profile();
+                    let rules = AmbientRules {
+                        auto_brighten: p.kbd_brighten_active,
+                        brighten_threshold: p.kbd_brighten_threshold,
+                        auto_dim: p.kbd_dim_active,
+                        dim_threshold: p.kbd_dim_threshold,
+                    };
+                    if tx.send(rules).is_ok() {
+                        return;
+                    }
+                }
                 let mode = self.timeout_mode;
                 self.apply_timeout(mode, &sender);
             }
@@ -403,6 +424,8 @@ impl BacklightIdleModel {
         if let Some(tx) = self.idle_stop_tx.take() {
             let _ = tx.send(false);
         }
+        self.rules_tx = None;
+        set_kbd_idle_dimmed(false);
 
         if mode == TimeoutMode::Never {
             return;
@@ -436,16 +459,18 @@ impl BacklightIdleModel {
         };
 
         let (stop_tx, stop_rx) = watch::channel(true);
+        let (rules_tx, rules_rx) = watch::channel(rules);
         let cmd_sender = sender.command_sender().clone();
 
         if is_gnome_desktop() {
             tokio::spawn(run_gnome_idle_monitor(
                 seconds,
                 battery_only,
-                rules,
+                rules_rx,
                 stop_rx,
                 cmd_sender,
             ));
+            self.rules_tx = Some(rules_tx);
         } else {
             tokio::spawn(run_swayidle(
                 seconds,
@@ -463,10 +488,11 @@ impl BacklightIdleModel {
 async fn run_gnome_idle_monitor(
     seconds: u32,
     battery_only: bool,
-    rules: AmbientRules,
+    mut rules_rx: watch::Receiver<AmbientRules>,
     mut stop_rx: watch::Receiver<bool>,
     cmd_sender: relm4::Sender<BacklightIdleCommandOutput>,
 ) {
+    let mut rules = *rules_rx.borrow_and_update();
     let session_conn = match zbus::Connection::session().await {
         Ok(c) => c,
         Err(e) => {
@@ -554,6 +580,9 @@ async fn run_gnome_idle_monitor(
                     break;
                 }
             }
+            Ok(()) = rules_rx.changed() => {
+                rules = *rules_rx.borrow_and_update();
+            }
             maybe_sig = watch_fired.next() => {
                 let Some(sig) = maybe_sig else {
                     break;
@@ -571,9 +600,6 @@ async fn run_gnome_idle_monitor(
                         continue;
                     }
                     let cur = kbd_proxy.get_brightness().await.unwrap_or(max_brightness);
-                    if cur <= 0 {
-                        continue;
-                    }
                     if active_watch_id.is_none() {
                         match idle_proxy.add_user_active_watch().await {
                             Ok(id) => active_watch_id = Some(id),
@@ -583,26 +609,39 @@ async fn run_gnome_idle_monitor(
                             }
                         }
                     }
-                    if kbd_proxy.set_brightness(0).await.is_ok() {
+                    if cur <= 0 {
+                        // Already off (e.g. dimmed by ambient sensor in a bright room), but record
+                        // the idle state so `auto_backlight` does not turn the keyboard on while
+                        // the user remains idle if the room darkens.
+                        set_kbd_idle_dimmed(true);
+                        dimmed_from = Some(0);
+                    } else if kbd_proxy.set_brightness(0).await.is_ok() {
+                        set_kbd_idle_dimmed(true);
                         dimmed_from = Some(cur);
                     } else if let Some(aid) = active_watch_id.take() {
                         let _ = idle_proxy.remove_watch(aid).await;
                     }
                 } else if active_watch_id == Some(fired_id) {
                     active_watch_id = None;
+                    set_kbd_idle_dimmed(false);
                     if let Some(prev) = dimmed_from.take() {
                         let ambient_lux = if rules.auto_brighten || rules.auto_dim {
                             read_ambient_lux(&sys_conn).await
                         } else {
                             None
                         };
+                        if prev == 0 && !rules.auto_brighten {
+                            continue;
+                        }
                         let target = decide_resume_brightness(
                             prev,
                             max_brightness,
                             rules,
                             ambient_lux,
                         );
-                        if let Err(e) = kbd_proxy.set_brightness(target).await {
+                        if target > 0
+                            && let Err(e) = kbd_proxy.set_brightness(target).await
+                        {
                             tracing::warn!("Failed to restore keyboard backlight: {e}");
                         }
                     }
@@ -611,6 +650,7 @@ async fn run_gnome_idle_monitor(
         }
     }
 
+    set_kbd_idle_dimmed(false);
     let _ = idle_proxy.remove_watch(idle_watch_id).await;
     if let Some(aid) = active_watch_id {
         let _ = idle_proxy.remove_watch(aid).await;
@@ -734,6 +774,15 @@ mod tests {
         };
         let ambient_cmd = busctl_resume_cmd(true, rules, 2);
         assert!(ambient_cmd.contains("v=2"));
-        assert!(ambient_cmd.contains("/sys/class/power_supply/*/online"));
+        assert!(ambient_cmd.contains("! grep -qx 1 /sys/class/power_supply/*/online"));
+    }
+
+    #[test]
+    fn test_kbd_idle_dimmed_shared_flag() {
+        use super::super::kbd_dbus::is_kbd_idle_dimmed;
+        set_kbd_idle_dimmed(true);
+        assert!(is_kbd_idle_dimmed());
+        set_kbd_idle_dimmed(false);
+        assert!(!is_kbd_idle_dimmed());
     }
 }

@@ -22,26 +22,70 @@ use relm4::prelude::*;
 use rust_i18n::t;
 use tokio::sync::watch;
 
-use super::kbd_dbus::{AmbientRules, KbdBacklightProxy, SensorProxyProxy};
+use super::kbd_dbus::{
+    AmbientRules, FdoScreenSaverProxy, GnomeScreenSaverProxy, KbdBacklightProxy,
+    LogindManagerProxy, LogindSessionProxy, MutterDisplayPowerProxy, SensorProxyProxy, UPowerProxy,
+    is_kbd_idle_dimmed,
+};
 use crate::services::config::AppConfig;
 
-#[zbus::proxy(
-    interface = "org.freedesktop.login1.Manager",
-    default_service = "org.freedesktop.login1",
-    default_path = "/org/freedesktop/login1"
-)]
-trait LogindManager {
-    fn get_session(&self, session_id: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-    fn get_session_by_pid(&self, pid: u32) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+/// Snapshot of screen, session, power, and idle state used to gate ambient keyboard backlight changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AmbientGuardState {
+    /// Display compositor reports power-save / DPMS off (`Mutter.DisplayConfig.PowerSaveMode != 0`).
+    pub display_power_save: bool,
+    /// Desktop screensaver / screen blank shield is active (`org.gnome.ScreenSaver` / `org.freedesktop.ScreenSaver`).
+    pub screensaver_active: bool,
+    /// Session reports `LockedHint == true`.
+    pub session_locked: bool,
+    /// Session reports `IdleHint == true`.
+    pub session_idle: bool,
+    /// Session reports `Active == true` (active VT/seat).
+    pub session_active: bool,
+    /// System is suspending (`PrepareForSleep` / `PreparingForSleep`).
+    pub preparing_for_sleep: bool,
+    /// Laptop lid is closed (`UPower.LidIsClosed` or `/proc/acpi/button/lid`).
+    pub lid_closed: bool,
+    /// Kernel DRM / backlight sysfs reports all displays powered off.
+    pub sysfs_display_off: bool,
+    /// In-app keyboard idle timeout (`backlight_idle`) has dimmed the keyboard.
+    pub kbd_idle_dimmed: bool,
 }
 
-#[zbus::proxy(
-    interface = "org.freedesktop.login1.Session",
-    default_service = "org.freedesktop.login1"
-)]
-trait LogindSession {
-    #[zbus(property)]
-    fn locked_hint(&self) -> zbus::Result<bool>;
+impl Default for AmbientGuardState {
+    fn default() -> Self {
+        Self {
+            display_power_save: false,
+            screensaver_active: false,
+            session_locked: false,
+            session_idle: false,
+            session_active: true,
+            preparing_for_sleep: false,
+            lid_closed: false,
+            sysfs_display_off: false,
+            kbd_idle_dimmed: false,
+        }
+    }
+}
+
+impl AmbientGuardState {
+    /// Returns `true` when the screen is off/blanked, the session is locked/idle/inactive,
+    /// the laptop lid is closed, or the system is suspending.
+    pub(super) fn is_screen_or_session_off(&self) -> bool {
+        self.display_power_save
+            || self.screensaver_active
+            || self.session_locked
+            || self.session_idle
+            || !self.session_active
+            || self.preparing_for_sleep
+            || self.lid_closed
+            || self.sysfs_display_off
+    }
+
+    /// Returns `true` when ambient light changes must not adjust the keyboard backlight.
+    pub(super) fn should_suppress_ambient(&self) -> bool {
+        self.is_screen_or_session_off() || self.kbd_idle_dimmed
+    }
 }
 
 /// State for the ambient-light-based keyboard backlight automation component.
@@ -56,8 +100,8 @@ pub struct AutoBacklightModel {
     brighten_threshold: f64,
     /// Ambient light level (lux) above which auto-dim triggers.
     dim_threshold: f64,
-    /// Sender to shut down the running sensor loop (send `false` to stop).
-    loop_tx: Option<watch::Sender<bool>>,
+    /// Sender to update [`AmbientRules`] in the running sensor loop (or send `None` to stop it).
+    rules_tx: Option<watch::Sender<Option<AmbientRules>>>,
     /// Last reported ambient light level, displayed in the UI while the loop is active.
     current_lux: Option<f64>,
 }
@@ -213,7 +257,7 @@ impl Component for AutoBacklightModel {
             auto_dim: profile.kbd_dim_active,
             brighten_threshold: profile.kbd_brighten_threshold,
             dim_threshold: profile.kbd_dim_threshold,
-            loop_tx: None,
+            rules_tx: None,
             current_lux: None,
         };
 
@@ -273,11 +317,15 @@ impl Component for AutoBacklightModel {
                 brighten_threshold,
                 dim_threshold,
             } => {
+                let changed = self.auto_brighten != brighten
+                    || self.auto_dim != dim
+                    || (self.brighten_threshold - brighten_threshold).abs() > f64::EPSILON
+                    || (self.dim_threshold - dim_threshold).abs() > f64::EPSILON;
                 self.auto_brighten = brighten;
                 self.auto_dim = dim;
                 self.brighten_threshold = brighten_threshold;
                 self.dim_threshold = dim_threshold;
-                if self.sensor_available {
+                if self.sensor_available && changed {
                     self.update_sensor_loop(sender);
                 }
             }
@@ -293,14 +341,8 @@ impl Component for AutoBacklightModel {
         match msg {
             AutoBacklightCommandOutput::SensorChecked(available) => {
                 self.sensor_available = available;
-                if available && (self.auto_brighten || self.auto_dim) {
-                    self.loop_tx = Some(start_sensor_loop(
-                        self.auto_brighten,
-                        self.brighten_threshold,
-                        self.auto_dim,
-                        self.dim_threshold,
-                        &sender,
-                    ));
+                if available {
+                    self.update_sensor_loop(sender);
                 }
             }
             AutoBacklightCommandOutput::Error(e) => {
@@ -314,25 +356,39 @@ impl Component for AutoBacklightModel {
 }
 
 impl AutoBacklightModel {
-    fn update_sensor_loop(&mut self, sender: ComponentSender<Self>) {
-        let active = self.auto_brighten || self.auto_dim;
-
-        if active {
-            if let Some(tx) = &self.loop_tx {
-                let _ = tx.send(false);
-            }
-            self.loop_tx = Some(start_sensor_loop(
-                self.auto_brighten,
-                self.brighten_threshold,
-                self.auto_dim,
-                self.dim_threshold,
-                &sender,
-            ));
+    fn current_rules(&self) -> Option<AmbientRules> {
+        if self.auto_brighten || self.auto_dim {
+            Some(AmbientRules {
+                auto_brighten: self.auto_brighten,
+                brighten_threshold: self.brighten_threshold,
+                auto_dim: self.auto_dim,
+                dim_threshold: self.dim_threshold,
+            })
         } else {
-            if let Some(tx) = self.loop_tx.take() {
-                let _ = tx.send(false);
+            None
+        }
+    }
+
+    fn update_sensor_loop(&mut self, sender: ComponentSender<Self>) {
+        if !self.sensor_available {
+            return;
+        }
+
+        match self.current_rules() {
+            Some(rules) => {
+                if let Some(tx) = &self.rules_tx
+                    && tx.send(Some(rules)).is_ok()
+                {
+                    return;
+                }
+                self.rules_tx = Some(start_sensor_loop(rules, &sender));
             }
-            self.current_lux = None;
+            None => {
+                if let Some(tx) = self.rules_tx.take() {
+                    let _ = tx.send(None);
+                }
+                self.current_lux = None;
+            }
         }
     }
 }
@@ -351,11 +407,10 @@ async fn is_sensor_available() -> bool {
 }
 
 /// Resolves a logind [`LogindSessionProxy`] for the current desktop session, used to detect
-/// whether the screen is locked.
+/// whether the session is locked, idle, or inactive.
 ///
 /// The session is looked up by `XDG_SESSION_ID` first, falling back to the running process'
-/// PID. Returns `None` if logind is unavailable or the session cannot be resolved, in which
-/// case callers treat the session as unlocked (preserving the pre-lock-aware behaviour).
+/// PID. Returns `None` if logind is unavailable or the session cannot be resolved.
 async fn resolve_session_proxy(conn: &zbus::Connection) -> Option<LogindSessionProxy<'static>> {
     let manager = LogindManagerProxy::new(conn).await.ok()?;
 
@@ -375,14 +430,57 @@ async fn resolve_session_proxy(conn: &zbus::Connection) -> Option<LogindSessionP
         .ok()
 }
 
-/// Returns `true` if the given session reports itself as locked via logind's `LockedHint`.
-///
-/// A missing proxy or a failed property read is treated as "not locked" so ambient automation
-/// keeps working on systems where logind lock state is unavailable.
-async fn session_locked(session: Option<&LogindSessionProxy<'_>>) -> bool {
-    match session {
-        Some(proxy) => proxy.locked_hint().await.unwrap_or(false),
+/// Refreshes the synchronous/sysfs and live D-Bus properties on `guard`.
+async fn refresh_live_guard_state(
+    guard: &mut AmbientGuardState,
+    session: Option<&LogindSessionProxy<'_>>,
+    logind_manager: Option<&LogindManagerProxy<'_>>,
+    upower: Option<&UPowerProxy<'_>>,
+    mutter_power: Option<&MutterDisplayPowerProxy<'_>>,
+    gnome_ss: Option<&GnomeScreenSaverProxy<'_>>,
+    fdo_ss: Option<&FdoScreenSaverProxy<'_>>,
+) {
+    guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+    guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+
+    let upower_lid = match upower {
+        Some(p) => p.lid_is_closed().await.unwrap_or(false),
         None => false,
+    };
+    guard.lid_closed = upower_lid || crate::sys_paths::is_lid_closed();
+
+    if let Some(s) = session {
+        if let Ok(locked) = s.locked_hint().await {
+            guard.session_locked = locked;
+        }
+        if let Ok(idle) = s.idle_hint().await {
+            guard.session_idle = idle;
+        }
+        if let Ok(active) = s.active().await {
+            guard.session_active = active;
+        }
+    }
+    if let Some(m) = logind_manager
+        && let Ok(prep) = m.preparing_for_sleep().await
+    {
+        guard.preparing_for_sleep = prep;
+    }
+    if let Some(mp) = mutter_power
+        && let Ok(mode) = mp.power_save_mode().await
+    {
+        guard.display_power_save = mode != 0;
+    }
+    let gnome_ss_active = match gnome_ss {
+        Some(gs) => gs.get_active().await.ok(),
+        None => None,
+    };
+    let fdo_ss_active = match fdo_ss {
+        Some(fs) => fs.get_active().await.ok(),
+        None => None,
+    };
+    if gnome_ss_active.is_some() || fdo_ss_active.is_some() {
+        guard.screensaver_active =
+            gnome_ss_active.unwrap_or(false) || fdo_ss_active.unwrap_or(false);
     }
 }
 
@@ -407,7 +505,9 @@ pub(super) fn decide_ambient_brightness(
 /// Applies auto-brighten/dim rules for a given lux reading via `UPower.KbdBacklight`
 /// and returns the resulting brightness level.
 ///
-/// Only sends a D-Bus call if brightness would actually change.
+/// Queries the actual hardware brightness when available so manual hotkey changes or
+/// idle-timeout dimming never leave `current_brightness` stale, and only sends a
+/// `SetBrightness` D-Bus call when brightness would actually change.
 async fn light_sensor_logic(
     level: f64,
     rules: AmbientRules,
@@ -415,6 +515,12 @@ async fn light_sensor_logic(
     max_brightness: i32,
     kbd_proxy: Option<&KbdBacklightProxy<'_>>,
 ) -> i32 {
+    if let Some(kbd) = kbd_proxy
+        && let Ok(hw_cur) = kbd.get_brightness().await
+    {
+        current_brightness = hw_cur;
+    }
+
     if let Some(target) =
         decide_ambient_brightness(level, rules, current_brightness, max_brightness)
         && let Some(kbd) = kbd_proxy
@@ -427,29 +533,68 @@ async fn light_sensor_logic(
     current_brightness
 }
 
+/// Ensures the keyboard backlight is turned off when the screen turns off / locks / suspends.
+async fn turn_off_kbd_on_screen_off(
+    current_brightness: &mut i32,
+    kbd_proxy: Option<&KbdBacklightProxy<'_>>,
+) {
+    let Some(kbd) = kbd_proxy else {
+        return;
+    };
+    let hw_cur = kbd.get_brightness().await.unwrap_or(*current_brightness);
+    if hw_cur != 0 {
+        match kbd.set_brightness(0).await {
+            Ok(()) => *current_brightness = 0,
+            Err(e) => tracing::warn!("UPower SetBrightness(0) on screen-off failed: {e}"),
+        }
+    } else {
+        *current_brightness = 0;
+    }
+}
+
+/// Handles a transition in [`AmbientGuardState`]:
+/// - When transitioning to screen/session off, turns the keyboard backlight off (`0`).
+/// - When transitioning back to screen/session on (and not suppressed by keyboard idle timeout),
+///   immediately re-evaluates the latest ambient light reading.
+async fn handle_guard_transition(
+    was_off: bool,
+    guard: &AmbientGuardState,
+    last_level: f64,
+    rules: AmbientRules,
+    current_brightness: &mut i32,
+    max_brightness: i32,
+    kbd_proxy: Option<&KbdBacklightProxy<'_>>,
+) {
+    let is_off = guard.is_screen_or_session_off();
+    if !was_off && is_off {
+        turn_off_kbd_on_screen_off(current_brightness, kbd_proxy).await;
+    } else if was_off && !guard.should_suppress_ambient() && last_level >= 0.0 {
+        *current_brightness = light_sensor_logic(
+            last_level,
+            rules,
+            -1,
+            max_brightness,
+            kbd_proxy,
+        )
+        .await;
+    }
+}
+
 /// Spawns a background task that monitors the ambient light sensor and adjusts the keyboard
-/// backlight in response to lux changes.
+/// backlight in response to lux changes while the screen is on and the session is active.
 ///
 /// A 3-lux hysteresis is applied - changes smaller than 3 lux are ignored to avoid
-/// flickering from sensor noise. The task shuts down when `false` is sent on the returned
-/// [`watch::Sender`].
+/// flickering from sensor noise. Rule updates are delivered live via the returned
+/// [`watch::Sender`]; sending `None` stops the task and releases the sensor claim.
 fn start_sensor_loop(
-    auto_brighten: bool,
-    brighten_threshold: f64,
-    auto_dim: bool,
-    dim_threshold: f64,
+    initial_rules: AmbientRules,
     sender: &ComponentSender<AutoBacklightModel>,
-) -> watch::Sender<bool> {
-    let (tx, mut rx) = watch::channel(true);
+) -> watch::Sender<Option<AmbientRules>> {
+    let (tx, mut rx) = watch::channel(Some(initial_rules));
     let out = sender.command_sender().clone();
-    let rules = AmbientRules {
-        auto_brighten,
-        brighten_threshold,
-        auto_dim,
-        dim_threshold,
-    };
 
     tokio::spawn(async move {
+        let mut rules = initial_rules;
         let conn = match zbus::Connection::system().await {
             Ok(c) => c,
             Err(e) => {
@@ -493,26 +638,88 @@ fn start_sensor_loop(
                 .unwrap_or(3),
             None => 3,
         };
+        let mut kbd_changed_stream = match &kbd_proxy {
+            Some(p) => p.receive_brightness_changed().await.ok(),
+            None => None,
+        };
 
-        // Used to skip ambient-driven brightness changes while the session is locked, so a
-        // change in ambient light does not switch the keyboard backlight on behind the lock screen.
+        let logind_manager = LogindManagerProxy::new(&conn).await.ok();
+        let mut sleep_stream = match &logind_manager {
+            Some(m) => m.receive_prepare_for_sleep().await.ok(),
+            None => None,
+        };
+
         let session = resolve_session_proxy(&conn).await;
-        // Re-applies the ambient rules when the session unlocks, since light-level events that
-        // arrived while locked were ignored and would otherwise not be reconsidered until the
-        // ambient level next changes by more than the hysteresis.
         let mut lock_stream = match &session {
             Some(proxy) => Some(proxy.receive_locked_hint_changed().await),
             None => None,
         };
+        let mut idle_hint_stream = match &session {
+            Some(proxy) => Some(proxy.receive_idle_hint_changed().await),
+            None => None,
+        };
+        let mut active_stream = match &session {
+            Some(proxy) => Some(proxy.receive_active_changed().await),
+            None => None,
+        };
+
+        let upower_proxy = UPowerProxy::new(&conn).await.ok();
+        let mut lid_stream = match &upower_proxy {
+            Some(p) => Some(p.receive_lid_is_closed_changed().await),
+            None => None,
+        };
+
+        let session_conn = zbus::Connection::session().await.ok();
+        let mutter_power = match &session_conn {
+            Some(sc) => MutterDisplayPowerProxy::new(sc).await.ok(),
+            None => None,
+        };
+        let mut mutter_power_stream = match &mutter_power {
+            Some(mp) => Some(mp.receive_power_save_mode_changed().await),
+            None => None,
+        };
+
+        let gnome_ss = match &session_conn {
+            Some(sc) => GnomeScreenSaverProxy::new(sc).await.ok(),
+            None => None,
+        };
+        let mut gnome_ss_stream = match &gnome_ss {
+            Some(gs) => gs.receive_active_changed().await.ok(),
+            None => None,
+        };
+
+        let fdo_ss = match &session_conn {
+            Some(sc) => FdoScreenSaverProxy::new(sc).await.ok(),
+            None => None,
+        };
+        let mut fdo_ss_stream = match &fdo_ss {
+            Some(fs) => fs.receive_active_changed().await.ok(),
+            None => None,
+        };
+
+        let mut guard = AmbientGuardState::default();
+        refresh_live_guard_state(
+            &mut guard,
+            session.as_ref(),
+            logind_manager.as_ref(),
+            upower_proxy.as_ref(),
+            mutter_power.as_ref(),
+            gnome_ss.as_ref(),
+            fdo_ss.as_ref(),
+        )
+        .await;
 
         let level_stream = proxy.receive_light_level_changed().await;
-        let mut current_brightness: i32 = -1;
+        let mut current_brightness: i32 = match kbd_proxy.as_ref() {
+            Some(p) => p.get_brightness().await.unwrap_or(-1),
+            None => -1,
+        };
         let mut last_level: f64 = -100.0;
 
         match proxy.light_level().await {
             Ok(level) => {
                 last_level = level;
-                if !session_locked(session.as_ref()).await {
+                if !guard.should_suppress_ambient() {
                     current_brightness = light_sensor_logic(
                         level,
                         rules,
@@ -534,9 +741,120 @@ fn start_sensor_loop(
 
         loop {
             tokio::select! {
-                _ = rx.changed() => {
-                    if !*rx.borrow() {
+                res = rx.changed() => {
+                    if res.is_err() {
                         break;
+                    }
+                    let Some(new_rules) = *rx.borrow_and_update() else {
+                        break;
+                    };
+                    rules = new_rules;
+                    refresh_live_guard_state(
+                        &mut guard,
+                        session.as_ref(),
+                        logind_manager.as_ref(),
+                        upower_proxy.as_ref(),
+                        mutter_power.as_ref(),
+                        gnome_ss.as_ref(),
+                        fdo_ss.as_ref(),
+                    )
+                    .await;
+                    if !guard.should_suppress_ambient() && last_level >= 0.0 {
+                        current_brightness = light_sensor_logic(
+                            last_level,
+                            rules,
+                            current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_kbd = async {
+                    match kbd_changed_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(sig) = changed_kbd
+                        && let Ok(args) = sig.args()
+                    {
+                        current_brightness = args.value;
+                    }
+                }
+                changed_mutter = async {
+                    match mutter_power_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(change) = changed_mutter
+                        && let Ok(mode) = change.get().await
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.display_power_save = mode != 0;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_gnome_ss = async {
+                    match gnome_ss_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(sig) = changed_gnome_ss
+                        && let Ok(args) = sig.args()
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.screensaver_active = args.new_value;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_fdo_ss = async {
+                    match fdo_ss_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(sig) = changed_fdo_ss
+                        && let Ok(args) = sig.args()
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.screensaver_active = args.new_value;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 changed_lock = async {
@@ -545,20 +863,123 @@ fn start_sensor_loop(
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(change) = changed_lock {
-                        // On unlock, re-evaluate the latest known ambient level. Reset the cached
-                        // brightness to `-1` so the rules apply even if the lock screen changed the
-                        // hardware brightness behind our back.
-                        if matches!(change.get().await, Ok(false)) && last_level >= 0.0 {
-                            current_brightness = light_sensor_logic(
-                                last_level,
-                                rules,
-                                -1,
-                                max_brightness,
-                                kbd_proxy.as_ref(),
-                            )
-                            .await;
-                        }
+                    if let Some(change) = changed_lock
+                        && let Ok(locked) = change.get().await
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.session_locked = locked;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_idle_hint = async {
+                    match idle_hint_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(change) = changed_idle_hint
+                        && let Ok(idle) = change.get().await
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.session_idle = idle;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_active = async {
+                    match active_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(change) = changed_active
+                        && let Ok(active) = change.get().await
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.session_active = active;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_sleep = async {
+                    match sleep_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(sig) = changed_sleep
+                        && let Ok(args) = sig.args()
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.preparing_for_sleep = args.start;
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                changed_lid = async {
+                    match lid_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(change) = changed_lid
+                        && let Ok(closed) = change.get().await
+                    {
+                        let was_off = guard.is_screen_or_session_off();
+                        guard.lid_closed = closed || crate::sys_paths::is_lid_closed();
+                        guard.sysfs_display_off = !crate::sys_paths::is_any_display_powered();
+                        guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                        handle_guard_transition(
+                            was_off,
+                            &guard,
+                            last_level,
+                            rules,
+                            &mut current_brightness,
+                            max_brightness,
+                            kbd_proxy.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 maybe = level_stream.next() => {
@@ -569,7 +990,17 @@ fn start_sensor_loop(
                                     continue;
                                 }
                                 last_level = level;
-                                if !session_locked(session.as_ref()).await {
+                                refresh_live_guard_state(
+                                    &mut guard,
+                                    session.as_ref(),
+                                    logind_manager.as_ref(),
+                                    upower_proxy.as_ref(),
+                                    mutter_power.as_ref(),
+                                    gnome_ss.as_ref(),
+                                    fdo_ss.as_ref(),
+                                )
+                                .await;
+                                if !guard.should_suppress_ambient() {
                                     current_brightness = light_sensor_logic(
                                         level,
                                         rules,
@@ -642,5 +1073,58 @@ mod tests {
         assert_eq!(decide_ambient_brightness(40.0, rules, 3, 3), Some(0));
         // Already off -> no redundant call
         assert_eq!(decide_ambient_brightness(40.0, rules, 0, 3), None);
+    }
+
+    #[test]
+    fn test_ambient_guard_state_suppression() {
+        let mut guard = AmbientGuardState::default();
+        assert!(!guard.is_screen_or_session_off());
+        assert!(!guard.should_suppress_ambient());
+
+        // Mutter DPMS power save
+        guard.display_power_save = true;
+        assert!(guard.is_screen_or_session_off());
+        assert!(guard.should_suppress_ambient());
+        guard.display_power_save = false;
+
+        // ScreenSaver / blanking shield active
+        guard.screensaver_active = true;
+        assert!(guard.is_screen_or_session_off());
+        guard.screensaver_active = false;
+
+        // Session locked
+        guard.session_locked = true;
+        assert!(guard.is_screen_or_session_off());
+        guard.session_locked = false;
+
+        // Session idle hint
+        guard.session_idle = true;
+        assert!(guard.is_screen_or_session_off());
+        guard.session_idle = false;
+
+        // Session on inactive VT
+        guard.session_active = false;
+        assert!(guard.is_screen_or_session_off());
+        guard.session_active = true;
+
+        // System suspending
+        guard.preparing_for_sleep = true;
+        assert!(guard.is_screen_or_session_off());
+        guard.preparing_for_sleep = false;
+
+        // Laptop lid closed
+        guard.lid_closed = true;
+        assert!(guard.is_screen_or_session_off());
+        guard.lid_closed = false;
+
+        // Kernel DRM / backlight sysfs display off
+        guard.sysfs_display_off = true;
+        assert!(guard.is_screen_or_session_off());
+        guard.sysfs_display_off = false;
+
+        // Keyboard idle timeout dimmed: suppresses ambient evaluation without counting as screen-off
+        guard.kbd_idle_dimmed = true;
+        assert!(!guard.is_screen_or_session_off());
+        assert!(guard.should_suppress_ambient());
     }
 }

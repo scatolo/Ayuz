@@ -6,7 +6,7 @@ Repository guidance for coding agents and contributors working on **Ayuz** (`sca
 
 ## 1. Fork Identity & Target Scope
 
-- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.2.2` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
+- **Fork**: `scatolo/Ayuz` (downstream fork of `Traciges/Ayuz`), package version `1.2.3` (`Cargo.toml`), Rust `edition = "2024"`, license `GPL-3.0-or-later`.
 - **Primary Fork Target**: **ASUS Zenbook 14 OLED (UX3405CA)** running **Fedora 44 / 45 · GNOME (Wayland)**.
 - **Upstream Target Retained**: **ASUS Zenbook S16** running **Fedora 43 · KDE Plasma (Wayland)** (and COSMIC where supported).
 - **Explicit Scope Boundaries**:

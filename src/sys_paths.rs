@@ -37,6 +37,8 @@ pub const MAX_SAFE_PERF_PCT: u8 = 100;
 pub const SYS_ASUS_ARMOURY_ATTRS_DIR: &str =
     "/sys/class/firmware-attributes/asus-armoury/attributes";
 pub const SYS_DRM_DIR: &str = "/sys/class/drm";
+pub const SYS_BACKLIGHT_DIR: &str = "/sys/class/backlight";
+pub const PROC_ACPI_LID_DIR: &str = "/proc/acpi/button/lid";
 pub const DEV_UINPUT: &str = "/dev/uinput";
 pub const DEV_INPUT_DIR: &str = "/dev/input";
 pub const PROC_BUS_INPUT_DEVICES: &str = "/proc/bus/input/devices";
@@ -537,6 +539,97 @@ pub fn is_path_writable(path: &Path) -> bool {
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .is_ok()
+}
+
+/// Returns `true` if at least one connected display appears to be powered on according to
+/// `/sys/class/drm` and `/sys/class/backlight`.
+///
+/// Fails open (`true`) when sysfs exposes neither DRM connector state nor backlight power state
+/// (e.g. inside a headless container).
+pub fn is_any_display_powered() -> bool {
+    is_any_display_powered_in(Path::new(SYS_DRM_DIR), Path::new(SYS_BACKLIGHT_DIR))
+}
+
+/// Path-parameterized version of [`is_any_display_powered`] for headless unit testing.
+pub fn is_any_display_powered_in(drm_dir: &Path, backlight_dir: &Path) -> bool {
+    let mut bl_any_found = false;
+    let mut bl_any_on = false;
+    if let Ok(entries) = std::fs::read_dir(backlight_dir) {
+        for entry in entries.flatten() {
+            if let Some(bl_power) = read_trimmed(&entry.path().join("bl_power")) {
+                bl_any_found = true;
+                if bl_power == "0" {
+                    bl_any_on = true;
+                }
+            }
+        }
+    }
+    let internal_bl_powered_off = bl_any_found && !bl_any_on;
+
+    let mut connected_count = 0usize;
+    let mut active_count = 0usize;
+    if let Ok(entries) = std::fs::read_dir(drm_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with("card") || !name_str.contains('-') {
+                continue;
+            }
+            let path = entry.path();
+            let Some(status) = read_trimmed(&path.join("status")) else {
+                continue;
+            };
+            if !status.eq_ignore_ascii_case("connected") {
+                continue;
+            }
+            connected_count += 1;
+
+            let enabled_ok = read_trimmed(&path.join("enabled"))
+                .map(|v| !v.eq_ignore_ascii_case("disabled"))
+                .unwrap_or(true);
+            let dpms_ok = read_trimmed(&path.join("dpms"))
+                .map(|v| v.eq_ignore_ascii_case("on"))
+                .unwrap_or(true);
+
+            let lower_name = name_str.to_ascii_lowercase();
+            let is_internal = lower_name.contains("-edp-")
+                || lower_name.contains("-lvds-")
+                || lower_name.contains("-dsi-");
+            let bl_ok = !(is_internal && internal_bl_powered_off);
+
+            if enabled_ok && dpms_ok && bl_ok {
+                active_count += 1;
+            }
+        }
+    }
+
+    if connected_count > 0 {
+        active_count > 0
+    } else if bl_any_found {
+        bl_any_on
+    } else {
+        true
+    }
+}
+
+/// Returns `true` if `/proc/acpi/button/lid/*/state` reports the laptop lid as closed.
+pub fn is_lid_closed() -> bool {
+    is_lid_closed_in(Path::new(PROC_ACPI_LID_DIR))
+}
+
+/// Path-parameterized version of [`is_lid_closed`] for headless unit testing.
+pub fn is_lid_closed_in(lid_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(lid_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Some(state) = read_trimmed(&entry.path().join("state"))
+            && state.to_ascii_lowercase().contains("closed")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Formats an OS-appropriate package install command based on `/etc/os-release`.
@@ -1170,5 +1263,67 @@ cpu1 71 0 89 118089 151 12 2 0 0 0
             package_install_command_from_os_release("ID=arch\n", "playerctl", "playerctl", "playerctl"),
             "sudo pacman -S playerctl"
         );
+    }
+
+    #[test]
+    fn test_is_any_display_powered_in_drm_and_backlight() {
+        let drm = TempMockDir::new("drm_power");
+        let bl = TempMockDir::new("bl_power");
+
+        // Empty dirs -> fail-open (true)
+        assert!(is_any_display_powered_in(&drm.path, &bl.path));
+
+        // Internal eDP-1 connected and On
+        let edp = drm.path.join("card1-eDP-1");
+        fs::create_dir_all(&edp).unwrap();
+        fs::write(edp.join("status"), "connected\n").unwrap();
+        fs::write(edp.join("enabled"), "enabled\n").unwrap();
+        fs::write(edp.join("dpms"), "On\n").unwrap();
+
+        let hdmi = drm.path.join("card1-HDMI-A-1");
+        fs::create_dir_all(&hdmi).unwrap();
+        fs::write(hdmi.join("status"), "disconnected\n").unwrap();
+        fs::write(hdmi.join("dpms"), "Off\n").unwrap();
+
+        assert!(is_any_display_powered_in(&drm.path, &bl.path));
+
+        // DPMS Off on eDP-1 -> false
+        fs::write(edp.join("dpms"), "Off\n").unwrap();
+        assert!(!is_any_display_powered_in(&drm.path, &bl.path));
+
+        // DPMS On, but backlight bl_power = 4 (powerdown) -> false for internal panel
+        fs::write(edp.join("dpms"), "On\n").unwrap();
+        let intel_bl = bl.path.join("intel_backlight");
+        fs::create_dir_all(&intel_bl).unwrap();
+        fs::write(intel_bl.join("bl_power"), "4\n").unwrap();
+        assert!(!is_any_display_powered_in(&drm.path, &bl.path));
+
+        // External HDMI connected & On while internal panel bl_power = 4 -> true
+        fs::write(hdmi.join("status"), "connected\n").unwrap();
+        fs::write(hdmi.join("enabled"), "enabled\n").unwrap();
+        fs::write(hdmi.join("dpms"), "On\n").unwrap();
+        assert!(is_any_display_powered_in(&drm.path, &bl.path));
+
+        // Both off -> false
+        fs::write(hdmi.join("dpms"), "Off\n").unwrap();
+        assert!(!is_any_display_powered_in(&drm.path, &bl.path));
+
+        // Backlight unblanked (0) -> true
+        fs::write(intel_bl.join("bl_power"), "0\n").unwrap();
+        assert!(is_any_display_powered_in(&drm.path, &bl.path));
+    }
+
+    #[test]
+    fn test_is_lid_closed_in() {
+        let lid = TempMockDir::new("acpi_lid");
+        assert!(!is_lid_closed_in(&lid.path));
+
+        let lid0 = lid.path.join("LID0");
+        fs::create_dir_all(&lid0).unwrap();
+        fs::write(lid0.join("state"), "state:      open\n").unwrap();
+        assert!(!is_lid_closed_in(&lid.path));
+
+        fs::write(lid0.join("state"), "state:      closed\n").unwrap();
+        assert!(is_lid_closed_in(&lid.path));
     }
 }
