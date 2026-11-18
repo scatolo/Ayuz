@@ -178,6 +178,13 @@ static SEARCH_INDEX: &[SearchItem] = &[
         component_key: "oled_care",
     },
     SearchItem {
+        title_key: "oled_care_idle_dim_title",
+        page_icon: "video-display-symbolic",
+        page_title_key: "tab_display",
+        page_name: "display",
+        component_key: "oled_care",
+    },
+    SearchItem {
         title_key: "color_gamut_title",
         page_icon: "video-display-symbolic",
         page_title_key: "tab_display",
@@ -388,6 +395,13 @@ static SEARCH_INDEX: &[SearchItem] = &[
     },
     SearchItem {
         title_key: "fan_group_title",
+        page_icon: "preferences-system-symbolic",
+        page_title_key: "tab_system",
+        page_name: "system",
+        component_key: "fan",
+    },
+    SearchItem {
+        title_key: "fan_rpm_title",
         page_icon: "preferences-system-symbolic",
         page_title_key: "tab_system",
         page_name: "system",

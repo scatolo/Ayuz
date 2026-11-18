@@ -30,11 +30,25 @@ use crate::services::kde_brightness;
 
 /// Fraction of touchpad width/height that counts as an edge zone (8%)
 const EDGE_PERCENT: f64 = 0.08;
+/// Extra margin (as a fraction of axis span) beyond the 8% entry bound before
+/// an active edge gesture cancels into [`GestureState::Other`].
+const EDGE_EXIT_HYSTERESIS: f64 = 0.04;
 /// Minimum movement in touchpad units required to trigger an action
 const STEP_THRESHOLD: i32 = 300;
 /// Delay after creating a virtual uinput device so udev/libinput/Mutter have
 /// opened the new `/dev/input/event*` node before the first key event arrives.
 const UINPUT_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+/// Entry and hysteresis-padded exit thresholds for edge gesture zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EdgeBounds {
+    pub left_entry: i32,
+    pub right_entry: i32,
+    pub top_entry: i32,
+    pub left_exit: i32,
+    pub right_exit: i32,
+    pub top_exit: i32,
+}
 
 /// Computes `(left_bound, right_bound, top_bound)` from the touchpad's axis
 /// minimum/maximum bounds, ensuring non-zero or negative minimums are respected.
@@ -50,7 +64,29 @@ pub(crate) fn calc_edge_bounds(bounds: TouchpadBounds) -> (i32, i32, i32) {
     (left_bound, right_bound, top_bound)
 }
 
+/// Computes both entry and exit edge bounds with [`EDGE_EXIT_HYSTERESIS`] padding.
+pub(crate) fn calc_all_edge_bounds(bounds: TouchpadBounds) -> EdgeBounds {
+    let (left_entry, right_entry, top_entry) = calc_edge_bounds(bounds);
+    let x_span = (bounds.x_max as i64 - bounds.x_min as i64).max(0) as f64;
+    let y_span = (bounds.y_max as i64 - bounds.y_min as i64).max(0) as f64;
+    let x_hyst = (x_span * EDGE_EXIT_HYSTERESIS).round() as i64;
+    let y_hyst = (y_span * EDGE_EXIT_HYSTERESIS).round() as i64;
+    let left_exit = (left_entry as i64 + x_hyst).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let right_exit =
+        (right_entry as i64 - x_hyst).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let top_exit = (top_entry as i64 + y_hyst).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    EdgeBounds {
+        left_entry,
+        right_entry,
+        top_entry,
+        left_exit,
+        right_exit,
+        top_exit,
+    }
+}
+
 /// Tracks the current touch gesture as events arrive from the input device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GestureState {
     /// No finger is currently touching the pad.
     Idle,
@@ -62,8 +98,20 @@ enum GestureState {
     RightEdge { last_y: i32 },
     /// Touch started in the top edge zone; triggers media prev/next on horizontal movement.
     TopEdge { start_x: i32, done: bool },
-    /// Touch started outside any edge zone - no action will be taken.
+    /// Touch started outside or left an edge zone - no action will be taken.
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopEdgeAction {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerticalEdgeAction {
+    Volume { increase: bool },
+    Brightness { delta: i32 },
 }
 
 /// Transitions a [`GestureState::Classifying`] state to the appropriate edge state once both
@@ -86,6 +134,90 @@ fn try_classify(state: &mut GestureState, left: i32, right: i32, top: i32) {
         } else {
             GestureState::Other
         };
+    }
+}
+
+/// Processes an `ABS_X` / `ABS_MT_POSITION_X` event for the active gesture state.
+///
+/// Cancels `LeftEdge` / `RightEdge` into `GestureState::Other` as soon as the finger leaves
+/// the edge zone (past the exit hysteresis bound), preventing normal cursor movement that
+/// starts near an edge from triggering volume or brightness jumps across the pad.
+fn handle_abs_x(
+    state: &mut GestureState,
+    value: i32,
+    bounds: EdgeBounds,
+) -> Option<TopEdgeAction> {
+    match state {
+        GestureState::Classifying { x, .. } => {
+            *x = Some(value);
+            try_classify(state, bounds.left_entry, bounds.right_entry, bounds.top_entry);
+            None
+        }
+        GestureState::LeftEdge { .. } if value > bounds.left_exit => {
+            *state = GestureState::Other;
+            None
+        }
+        GestureState::RightEdge { .. } if value < bounds.right_exit => {
+            *state = GestureState::Other;
+            None
+        }
+        GestureState::TopEdge { start_x, done } => {
+            if !*done {
+                let dx = value.saturating_sub(*start_x);
+                if dx.unsigned_abs() >= STEP_THRESHOLD as u32 {
+                    *done = true;
+                    return Some(if dx < 0 {
+                        TopEdgeAction::Previous
+                    } else {
+                        TopEdgeAction::Next
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Processes an `ABS_Y` / `ABS_MT_POSITION_Y` event for the active gesture state.
+///
+/// Cancels `TopEdge` into `GestureState::Other` if the finger slides below the top edge zone.
+fn handle_abs_y(
+    state: &mut GestureState,
+    value: i32,
+    bounds: EdgeBounds,
+) -> Option<VerticalEdgeAction> {
+    match state {
+        GestureState::Classifying { y, .. } => {
+            *y = Some(value);
+            try_classify(state, bounds.left_entry, bounds.right_entry, bounds.top_entry);
+            None
+        }
+        GestureState::TopEdge { .. } if value > bounds.top_exit => {
+            *state = GestureState::Other;
+            None
+        }
+        GestureState::LeftEdge { last_y } => {
+            let dy = value.saturating_sub(*last_y);
+            if dy.unsigned_abs() >= STEP_THRESHOLD as u32 {
+                *last_y = value;
+                Some(VerticalEdgeAction::Volume { increase: dy < 0 })
+            } else {
+                None
+            }
+        }
+        GestureState::RightEdge { last_y } => {
+            let dy = value.saturating_sub(*last_y);
+            if dy.unsigned_abs() >= STEP_THRESHOLD as u32 {
+                *last_y = value;
+                Some(VerticalEdgeAction::Brightness {
+                    delta: if dy < 0 { 5 } else { -5 },
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -250,7 +382,7 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
         Some(b) => b,
         None => return,
     };
-    let (left_bound, right_bound, top_bound) = calc_edge_bounds(bounds);
+    let edge_bounds = calc_all_edge_bounds(bounds);
 
     let Some(mut stream) = open_event_stream(device) else {
         return;
@@ -301,78 +433,50 @@ pub async fn run_gesture_loop(mut shutdown: watch::Receiver<bool>) {
                 _,
                 AbsoluteAxisCode::ABS_X | AbsoluteAxisCode::ABS_MT_POSITION_X,
                 value,
-            ) => {
-                if let GestureState::Classifying { x, .. } = &mut state {
-                    *x = Some(value);
-                    try_classify(&mut state, left_bound, right_bound, top_bound);
-                } else if let GestureState::TopEdge { start_x, done } = &mut state {
-                    if !*done {
-                        let dx = value - *start_x;
-                        if dx.abs() >= STEP_THRESHOLD {
-                            *done = true;
-                            if dx < 0 {
-                                run_action("playerctl", &["previous"]).await;
-                            } else {
-                                run_action("playerctl", &["next"]).await;
-                            }
-                        }
-                    }
+            ) => match handle_abs_x(&mut state, value, edge_bounds) {
+                Some(TopEdgeAction::Previous) => {
+                    run_action("playerctl", &["previous"]).await;
                 }
-            }
+                Some(TopEdgeAction::Next) => {
+                    run_action("playerctl", &["next"]).await;
+                }
+                None => {}
+            },
             EventSummary::AbsoluteAxis(
                 _,
                 AbsoluteAxisCode::ABS_Y | AbsoluteAxisCode::ABS_MT_POSITION_Y,
                 value,
-            ) => {
-                if let GestureState::Classifying { y, .. } = &mut state {
-                    *y = Some(value);
-                    try_classify(&mut state, left_bound, right_bound, top_bound);
-                } else {
-                    match &mut state {
-                        GestureState::LeftEdge { last_y } => {
-                            let dy = value - *last_y;
-                            if dy.abs() >= STEP_THRESHOLD {
-                                *last_y = value;
-                                adjust_volume(dy < 0, gnome_volume_uinput.as_mut()).await;
-                            }
+            ) => match handle_abs_y(&mut state, value, edge_bounds) {
+                Some(VerticalEdgeAction::Volume { increase }) => {
+                    adjust_volume(increase, gnome_volume_uinput.as_mut()).await;
+                }
+                Some(VerticalEdgeAction::Brightness { delta }) => {
+                    let arg = if delta > 0 { "5%+" } else { "5%-" };
+                    if is_kde_desktop() {
+                        if let Err(e) = kde_brightness::adjust_brightness_relative(delta).await {
+                            tracing::warn!(
+                                "PowerDevil setBrightness failed, falling back to brightnessctl: {e}"
+                            );
+                            run_action("brightnessctl", &["set", arg]).await;
                         }
-                        GestureState::RightEdge { last_y } => {
-                            let dy = value - *last_y;
-                            if dy.abs() >= STEP_THRESHOLD {
-                                *last_y = value;
-                                let delta = if dy < 0 { 5 } else { -5 };
-                                let arg = if delta > 0 { "5%+" } else { "5%-" };
-                                if is_kde_desktop() {
-                                    if let Err(e) =
-                                        kde_brightness::adjust_brightness_relative(delta).await
-                                    {
-                                        tracing::warn!(
-                                            "PowerDevil setBrightness failed, falling back to brightnessctl: {e}"
-                                        );
-                                        run_action("brightnessctl", &["set", arg]).await;
-                                    }
-                                } else if is_gnome_desktop() {
-                                    if let Err(e) =
-                                        gnome_brightness::adjust_brightness_relative_with_uinput(
-                                            delta,
-                                            gnome_uinput.as_mut(),
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "GNOME brightness adjustment failed, falling back to brightnessctl: {e}"
-                                        );
-                                        run_action("brightnessctl", &["set", arg]).await;
-                                    }
-                                } else {
-                                    run_action("brightnessctl", &["set", arg]).await;
-                                }
-                            }
+                    } else if is_gnome_desktop() {
+                        if let Err(e) = gnome_brightness::adjust_brightness_relative_with_uinput(
+                            delta,
+                            gnome_uinput.as_mut(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "GNOME brightness adjustment failed, falling back to brightnessctl: {e}"
+                            );
+                            run_action("brightnessctl", &["set", arg]).await;
                         }
-                        _ => {}
+                    } else {
+                        run_action("brightnessctl", &["set", arg]).await;
                     }
                 }
-            }
+                None => {}
+            },
             EventSummary::Key(
                 _,
                 KeyCode::BTN_TOOL_DOUBLETAP | KeyCode::BTN_TOOL_TRIPLETAP,
@@ -501,5 +605,93 @@ mod tests {
         let (ex_left, ex_right, ex_top) = calc_edge_bounds(extreme);
         assert!(ex_left > i32::MIN && ex_right < i32::MAX);
         assert_eq!(ex_top, 500);
+    }
+
+    #[test]
+    fn test_edge_exit_cancels_right_edge_when_moving_toward_center() {
+        let bounds = calc_all_edge_bounds(TouchpadBounds {
+            x_min: 0,
+            x_max: 4000,
+            y_min: 0,
+            y_max: 2500,
+        });
+        assert_eq!(bounds.right_entry, 3680);
+        assert_eq!(bounds.right_exit, 3520);
+
+        let mut state = GestureState::Classifying {
+            x: Some(3800),
+            y: Some(1200),
+        };
+        try_classify(
+            &mut state,
+            bounds.left_entry,
+            bounds.right_entry,
+            bounds.top_entry,
+        );
+        assert_eq!(state, GestureState::RightEdge { last_y: 1200 });
+
+        // Slight wobble inside hysteresis band keeps RightEdge active
+        assert_eq!(handle_abs_x(&mut state, 3600, bounds), None);
+        assert_eq!(state, GestureState::RightEdge { last_y: 1200 });
+
+        // Moving cursor toward center past right_exit cancels to Other
+        assert_eq!(handle_abs_x(&mut state, 3500, bounds), None);
+        assert_eq!(state, GestureState::Other);
+
+        // Subsequent vertical movement anywhere on the pad must NOT trigger brightness
+        assert_eq!(handle_abs_y(&mut state, 500, bounds), None);
+        // Even returning back to the edge without lifting finger stays Other
+        assert_eq!(handle_abs_x(&mut state, 3900, bounds), None);
+        assert_eq!(handle_abs_y(&mut state, 100, bounds), None);
+        assert_eq!(state, GestureState::Other);
+    }
+
+    #[test]
+    fn test_edge_exit_cancels_left_and_top_edges() {
+        let bounds = calc_all_edge_bounds(TouchpadBounds {
+            x_min: 0,
+            x_max: 4000,
+            y_min: 0,
+            y_max: 2500,
+        });
+        assert_eq!(bounds.left_entry, 320);
+        assert_eq!(bounds.left_exit, 480);
+        assert_eq!(bounds.top_entry, 200);
+        assert_eq!(bounds.top_exit, 300);
+
+        // LeftEdge: within hysteresis triggers volume, leaving left_exit cancels
+        let mut left_state = GestureState::Classifying {
+            x: Some(200),
+            y: Some(1000),
+        };
+        try_classify(
+            &mut left_state,
+            bounds.left_entry,
+            bounds.right_entry,
+            bounds.top_entry,
+        );
+        assert_eq!(handle_abs_x(&mut left_state, 400, bounds), None);
+        assert_eq!(
+            handle_abs_y(&mut left_state, 650, bounds),
+            Some(VerticalEdgeAction::Volume { increase: true })
+        );
+        assert_eq!(handle_abs_x(&mut left_state, 500, bounds), None);
+        assert_eq!(left_state, GestureState::Other);
+        assert_eq!(handle_abs_y(&mut left_state, 200, bounds), None);
+
+        // TopEdge: sliding down below top_exit cancels before horizontal media skip triggers
+        let mut top_state = GestureState::Classifying {
+            x: Some(2000),
+            y: Some(100),
+        };
+        try_classify(
+            &mut top_state,
+            bounds.left_entry,
+            bounds.right_entry,
+            bounds.top_entry,
+        );
+        assert_eq!(handle_abs_y(&mut top_state, 350, bounds), None);
+        assert_eq!(top_state, GestureState::Other);
+        assert_eq!(handle_abs_x(&mut top_state, 2600, bounds), None);
     }
 }

@@ -435,6 +435,7 @@ impl AppModel {
             if !gnome_visible {
                 vis.hidden_title_keys.insert("oled_care_screen_blank_title");
                 vis.hidden_title_keys.insert("oled_care_ambient_brightness_title");
+                vis.hidden_title_keys.insert("oled_care_idle_dim_title");
             }
             if !self.hardware_support.intel_pstate_max_perf_supported {
                 vis.hidden_title_keys.insert("fan_cpu_max_perf_title");
@@ -469,6 +470,7 @@ impl AppModel {
             transparency: p.oled_care_transparency,
             gnome_screen_blank_secs: p.gnome_screen_blank_secs,
             gnome_ambient_brightness: p.gnome_ambient_brightness,
+            gnome_idle_dim: p.gnome_idle_dim,
         });
 
         // Audio
@@ -1312,13 +1314,14 @@ impl SimpleComponent for AppModel {
 
         root.set_hide_on_close(true);
 
-        // Pause Home metrics polling while the window is hidden (`--hidden` or closed to tray)
-        // or while another tab is active, and resume immediately when Home becomes visible.
+        // Pause Home and System fan-RPM polling while the window is hidden (`--hidden` or closed
+        // to tray) or while another tab is active, and resume immediately when visible.
         // `suppress_initial_present` prevents Relm4's initial `present()` call before
         // `idle_add_local_once` hides a `--hidden` window from triggering a spurious cycle.
         let suppress_initial_present = Rc::new(std::cell::Cell::new(init));
-        let update_home_polling: Rc<dyn Fn()> = {
+        let update_page_polling: Rc<dyn Fn()> = {
             let home_sender = model.home.sender().clone();
+            let fan_sender = model.fan.sender().clone();
             let win_weak = root.downgrade();
             let stack_weak = content_stack.downgrade();
             let suppress = suppress_initial_present.clone();
@@ -1326,21 +1329,21 @@ impl SimpleComponent for AppModel {
                 if suppress.get() {
                     return;
                 }
-                let active = win_weak
-                    .upgrade()
-                    .is_some_and(|w| w.is_visible())
-                    && stack_weak.upgrade().is_some_and(|s| {
-                        s.visible_child_name().as_deref() == Some(AppPage::Home.as_str())
-                    });
-                home_sender.emit(HomeMsg::SetPollingActive(active));
+                let visible = win_weak.upgrade().is_some_and(|w| w.is_visible());
+                let active_page = stack_weak.upgrade().and_then(|s| s.visible_child_name());
+                let home_active = visible && active_page.as_deref() == Some(AppPage::Home.as_str());
+                let system_active =
+                    visible && active_page.as_deref() == Some(AppPage::System.as_str());
+                home_sender.emit(HomeMsg::SetPollingActive(home_active));
+                fan_sender.emit(FanMsg::SetPollingActive(system_active));
             })
         };
         {
-            let update = update_home_polling.clone();
+            let update = update_page_polling.clone();
             root.connect_visible_notify(move |_| update());
         }
         {
-            let update = update_home_polling;
+            let update = update_page_polling;
             content_stack.connect_notify_local(Some("visible-child-name"), move |_, _| update());
         }
 

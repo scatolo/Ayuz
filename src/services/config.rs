@@ -99,6 +99,8 @@ pub struct Profile {
     pub gnome_screen_blank_secs: Option<u32>,
     #[serde(default)]
     pub gnome_ambient_brightness: Option<bool>,
+    #[serde(default)]
+    pub gnome_idle_dim: Option<bool>,
 
     // Audio
     pub audio_profile: u32,
@@ -199,6 +201,7 @@ impl Default for Profile {
             display_refresh_hz: None,
             gnome_screen_blank_secs: None,
             gnome_ambient_brightness: None,
+            gnome_idle_dim: None,
             audio_profile: 0,
             volume: 100.0,
             kbd_timeout_mode: 0,
@@ -434,6 +437,7 @@ mod tests {
         assert_eq!(profile.display_refresh_hz, None);
         assert_eq!(profile.gnome_screen_blank_secs, None);
         assert_eq!(profile.gnome_ambient_brightness, None);
+        assert_eq!(profile.gnome_idle_dim, None);
         assert_eq!(profile.cpu_max_perf_pct, None);
     }
 
@@ -445,6 +449,7 @@ mod tests {
             display_refresh_hz: Some(60),
             gnome_screen_blank_secs: Some(120),
             gnome_ambient_brightness: Some(true),
+            gnome_idle_dim: Some(false),
             cpu_max_perf_pct: Some(65),
             ..Profile::default()
         };
@@ -454,6 +459,7 @@ mod tests {
         assert_eq!(parsed.display_refresh_hz, Some(60));
         assert_eq!(parsed.gnome_screen_blank_secs, Some(120));
         assert_eq!(parsed.gnome_ambient_brightness, Some(true));
+        assert_eq!(parsed.gnome_idle_dim, Some(false));
         assert_eq!(parsed.cpu_max_perf_pct, Some(65));
     }
 

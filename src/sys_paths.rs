@@ -440,6 +440,151 @@ pub fn read_cpu_power_telemetry_in(
     }
 }
 
+/// Single fan speed reading from `/sys/class/hwmon`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanSensorReading {
+    pub label: String,
+    pub rpm: u32,
+}
+
+/// Aggregated fan speed telemetry across `/sys/class/hwmon`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FanRpmTelemetry {
+    pub fans: Vec<FanSensorReading>,
+}
+
+fn normalize_fan_label(raw: Option<String>, channel: usize) -> String {
+    let default_label = match channel {
+        1 => "CPU",
+        2 => "GPU",
+        3 => "Mid",
+        _ => "Fan",
+    };
+    let Some(label) = raw else {
+        return default_label.to_string();
+    };
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return default_label.to_string();
+    }
+    if trimmed.eq_ignore_ascii_case("cpu_fan") {
+        "CPU".to_string()
+    } else if trimmed.eq_ignore_ascii_case("gpu_fan") {
+        "GPU".to_string()
+    } else if trimmed.eq_ignore_ascii_case("mid_fan") {
+        "Mid".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Reads live fan RPM telemetry from `/sys/class/hwmon`.
+pub fn read_fan_rpm_telemetry() -> FanRpmTelemetry {
+    read_fan_rpm_telemetry_in(Path::new(SYS_HWMON_DIR))
+}
+
+/// Reads live fan RPM telemetry from an arbitrary hwmon directory (for headless unit testing).
+///
+/// Scans sorted `hwmon*` entries for `asus` / `asus-nb-wmi` / `asus_custom_fan_curve` /
+/// `asus-ec-sensors` and `acpi_fan` drivers. Disabled secondary channels (`fan2_input == 0`
+/// with `pwm2_enable == "0"`) on single-fan laptops are skipped. When `acpi_fan` exposes a
+/// positive reading (`> 0`), it overrides the primary fan's RPM for 1-RPM precision instead of
+/// the 100-RPM quantized `asus-nb-wmi` reading.
+pub fn read_fan_rpm_telemetry_in(hwmon_dir: &Path) -> FanRpmTelemetry {
+    let Ok(entries) = std::fs::read_dir(hwmon_dir) else {
+        return FanRpmTelemetry::default();
+    };
+
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    dirs.sort();
+
+    let mut asus_fans: Vec<FanSensorReading> = Vec::new();
+    let mut acpi_fan: Option<FanSensorReading> = None;
+
+    for dir in dirs {
+        let Some(name) = read_trimmed(&dir.join("name")) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+
+        if lower == "acpi_fan" {
+            if acpi_fan.is_none()
+                && let Some(rpm) =
+                    read_trimmed(&dir.join("fan1_input")).and_then(|s| s.parse::<u32>().ok())
+            {
+                let label = normalize_fan_label(read_trimmed(&dir.join("fan1_label")), 1);
+                acpi_fan = Some(FanSensorReading { label, rpm });
+            }
+            continue;
+        }
+
+        if asus_fans.is_empty()
+            && (lower == "asus"
+                || lower == "asus-nb-wmi"
+                || lower == "asus_custom_fan_curve"
+                || lower == "asus-ec-sensors")
+        {
+            for ch in 1..=3 {
+                let input_path = dir.join(format!("fan{ch}_input"));
+                let Some(rpm) = read_trimmed(&input_path).and_then(|s| s.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if ch > 1 && rpm == 0 {
+                    let pwm_disabled =
+                        read_trimmed(&dir.join(format!("pwm{ch}_enable"))).as_deref() == Some("0");
+                    if pwm_disabled {
+                        continue;
+                    }
+                }
+                let label =
+                    normalize_fan_label(read_trimmed(&dir.join(format!("fan{ch}_label"))), ch);
+                asus_fans.push(FanSensorReading { label, rpm });
+            }
+        }
+    }
+
+    if asus_fans.is_empty() {
+        if let Some(acpi) = acpi_fan {
+            return FanRpmTelemetry { fans: vec![acpi] };
+        }
+        return FanRpmTelemetry::default();
+    }
+
+    if let Some(acpi) = acpi_fan
+        && acpi.rpm > 0
+    {
+        asus_fans[0].rpm = acpi.rpm;
+    }
+
+    FanRpmTelemetry { fans: asus_fans }
+}
+
+/// Formats fan RPM telemetry for the compact Home metric card (e.g. `"1766 RPM"`,
+/// `"1766 / 2100 RPM"`, or `"N/A"`).
+pub fn format_fan_rpm_card(tel: &FanRpmTelemetry) -> String {
+    if tel.fans.is_empty() {
+        return "N/A".to_string();
+    }
+    let rpms: Vec<String> = tel.fans.iter().map(|f| f.rpm.to_string()).collect();
+    format!("{} RPM", rpms.join(" / "))
+}
+
+/// Formats fan RPM telemetry for the System -> Fan Mode status row (e.g. `"CPU: 1766 RPM"`).
+pub fn format_fan_rpm_summary(tel: &FanRpmTelemetry) -> Option<String> {
+    if tel.fans.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = tel
+        .fans
+        .iter()
+        .map(|f| format!("{}: {} RPM", f.label, f.rpm))
+        .collect();
+    Some(parts.join(" · "))
+}
+
 /// Checks whether an `asus-armoury` firmware attribute's `current_value` file has owner write permission.
 ///
 /// Attributes like `charge_mode` on UX3405CA are exposed read-only (`0444`) by the kernel driver;
@@ -568,6 +713,7 @@ pub fn is_any_display_powered_in(drm_dir: &Path, backlight_dir: &Path) -> bool {
 
     let mut connected_count = 0usize;
     let mut active_count = 0usize;
+    let mut saw_enabled_dpms_off = false;
     if let Ok(entries) = std::fs::read_dir(drm_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -576,6 +722,26 @@ pub fn is_any_display_powered_in(drm_dir: &Path, backlight_dir: &Path) -> bool {
                 continue;
             }
             let path = entry.path();
+
+            // Check cached DRM software state (`enabled` and `dpms`) before reading `status`,
+            // because reading `status` on disconnected ports can trigger kernel DDC/AUX probes.
+            let enabled_val = read_trimmed(&path.join("enabled"));
+            if enabled_val
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("disabled"))
+            {
+                continue;
+            }
+            let dpms_ok = read_trimmed(&path.join("dpms"))
+                .map(|v| v.eq_ignore_ascii_case("on"))
+                .unwrap_or(true);
+            if !dpms_ok {
+                if enabled_val.is_some() {
+                    saw_enabled_dpms_off = true;
+                }
+                continue;
+            }
+
             let Some(status) = read_trimmed(&path.join("status")) else {
                 continue;
             };
@@ -584,20 +750,13 @@ pub fn is_any_display_powered_in(drm_dir: &Path, backlight_dir: &Path) -> bool {
             }
             connected_count += 1;
 
-            let enabled_ok = read_trimmed(&path.join("enabled"))
-                .map(|v| !v.eq_ignore_ascii_case("disabled"))
-                .unwrap_or(true);
-            let dpms_ok = read_trimmed(&path.join("dpms"))
-                .map(|v| v.eq_ignore_ascii_case("on"))
-                .unwrap_or(true);
-
             let lower_name = name_str.to_ascii_lowercase();
             let is_internal = lower_name.contains("-edp-")
                 || lower_name.contains("-lvds-")
                 || lower_name.contains("-dsi-");
             let bl_ok = !(is_internal && internal_bl_powered_off);
 
-            if enabled_ok && dpms_ok && bl_ok {
+            if bl_ok {
                 active_count += 1;
             }
         }
@@ -605,6 +764,8 @@ pub fn is_any_display_powered_in(drm_dir: &Path, backlight_dir: &Path) -> bool {
 
     if connected_count > 0 {
         active_count > 0
+    } else if saw_enabled_dpms_off {
+        false
     } else if bl_any_found {
         bl_any_on
     } else {
@@ -1311,6 +1472,11 @@ cpu1 71 0 89 118089 151 12 2 0 0 0
         // Backlight unblanked (0) -> true
         fs::write(intel_bl.join("bl_power"), "0\n").unwrap();
         assert!(is_any_display_powered_in(&drm.path, &bl.path));
+
+        // eDP-1 DPMS Off while bl_power remains 0 -> still false
+        fs::write(edp.join("dpms"), "Off\n").unwrap();
+        fs::write(hdmi.join("enabled"), "disabled\n").unwrap();
+        assert!(!is_any_display_powered_in(&drm.path, &bl.path));
     }
 
     #[test]
@@ -1325,5 +1491,118 @@ cpu1 71 0 89 118089 151 12 2 0 0 0
 
         fs::write(lid0.join("state"), "state:      closed\n").unwrap();
         assert!(is_lid_closed_in(&lid.path));
+    }
+
+    // --- Fan RPM Telemetry Tests ---
+
+    #[test]
+    fn test_fan_rpm_empty_and_nonexistent_hwmon() {
+        let mock = TempMockDir::new("fan_empty");
+        let empty = read_fan_rpm_telemetry_in(&mock.path);
+        assert!(empty.fans.is_empty());
+        assert_eq!(format_fan_rpm_card(&empty), "N/A");
+        assert_eq!(format_fan_rpm_summary(&empty), None);
+
+        let nonexistent = std::env::temp_dir().join("ayuz_nonexistent_hwmon_fan_999");
+        let missing = read_fan_rpm_telemetry_in(&nonexistent);
+        assert!(missing.fans.is_empty());
+    }
+
+    #[test]
+    fn test_fan_rpm_single_fan_ux3405_with_acpi_fan_precision() {
+        let mock = TempMockDir::new("fan_ux3405");
+
+        let hwmon2 = mock.path.join("hwmon2");
+        fs::create_dir_all(&hwmon2).unwrap();
+        fs::write(hwmon2.join("name"), "acpi_fan\n").unwrap();
+        fs::write(hwmon2.join("fan1_input"), "1766\n").unwrap();
+
+        let hwmon5 = mock.path.join("hwmon5");
+        fs::create_dir_all(&hwmon5).unwrap();
+        fs::write(hwmon5.join("name"), "asus\n").unwrap();
+        fs::write(hwmon5.join("fan1_input"), "1700\n").unwrap();
+        fs::write(hwmon5.join("fan1_label"), "cpu_fan\n").unwrap();
+        fs::write(hwmon5.join("fan2_input"), "0\n").unwrap();
+        fs::write(hwmon5.join("pwm2_enable"), "0\n").unwrap();
+
+        let tel = read_fan_rpm_telemetry_in(&mock.path);
+        assert_eq!(
+            tel.fans,
+            vec![FanSensorReading {
+                label: "CPU".to_string(),
+                rpm: 1766,
+            }]
+        );
+        assert_eq!(format_fan_rpm_card(&tel), "1766 RPM");
+        assert_eq!(
+            format_fan_rpm_summary(&tel).as_deref(),
+            Some("CPU: 1766 RPM")
+        );
+    }
+
+    #[test]
+    fn test_fan_rpm_dual_fan_with_acpi_fan() {
+        let mock = TempMockDir::new("fan_dual");
+
+        let hwmon1 = mock.path.join("hwmon1");
+        fs::create_dir_all(&hwmon1).unwrap();
+        fs::write(hwmon1.join("name"), "asus_custom_fan_curve\n").unwrap();
+        fs::write(hwmon1.join("fan1_input"), "1800\n").unwrap();
+        fs::write(hwmon1.join("fan1_label"), "cpu_fan\n").unwrap();
+        fs::write(hwmon1.join("fan2_input"), "2100\n").unwrap();
+        fs::write(hwmon1.join("fan2_label"), "gpu_fan\n").unwrap();
+
+        let hwmon3 = mock.path.join("hwmon3");
+        fs::create_dir_all(&hwmon3).unwrap();
+        fs::write(hwmon3.join("name"), "acpi_fan\n").unwrap();
+        fs::write(hwmon3.join("fan1_input"), "1834\n").unwrap();
+
+        let tel = read_fan_rpm_telemetry_in(&mock.path);
+        assert_eq!(
+            tel.fans,
+            vec![
+                FanSensorReading {
+                    label: "CPU".to_string(),
+                    rpm: 1834,
+                },
+                FanSensorReading {
+                    label: "GPU".to_string(),
+                    rpm: 2100,
+                },
+            ]
+        );
+        assert_eq!(format_fan_rpm_card(&tel), "1834 / 2100 RPM");
+        assert_eq!(
+            format_fan_rpm_summary(&tel).as_deref(),
+            Some("CPU: 1834 RPM · GPU: 2100 RPM")
+        );
+    }
+
+    #[test]
+    fn test_fan_rpm_zero_rpm_stopped_fan() {
+        let mock = TempMockDir::new("fan_zero");
+
+        let hwmon0 = mock.path.join("hwmon0");
+        fs::create_dir_all(&hwmon0).unwrap();
+        fs::write(hwmon0.join("name"), "acpi_fan\n").unwrap();
+        fs::write(hwmon0.join("fan1_input"), "0\n").unwrap();
+
+        let hwmon1 = mock.path.join("hwmon1");
+        fs::create_dir_all(&hwmon1).unwrap();
+        fs::write(hwmon1.join("name"), "asus\n").unwrap();
+        fs::write(hwmon1.join("fan1_input"), "0\n").unwrap();
+        fs::write(hwmon1.join("fan2_input"), "0\n").unwrap();
+        fs::write(hwmon1.join("pwm2_enable"), "0\n").unwrap();
+
+        let tel = read_fan_rpm_telemetry_in(&mock.path);
+        assert_eq!(
+            tel.fans,
+            vec![FanSensorReading {
+                label: "CPU".to_string(),
+                rpm: 0,
+            }]
+        );
+        assert_eq!(format_fan_rpm_card(&tel), "0 RPM");
+        assert_eq!(format_fan_rpm_summary(&tel).as_deref(), Some("CPU: 0 RPM"));
     }
 }

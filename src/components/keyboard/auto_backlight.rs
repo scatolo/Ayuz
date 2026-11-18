@@ -990,16 +990,20 @@ fn start_sensor_loop(
                                     continue;
                                 }
                                 last_level = level;
-                                refresh_live_guard_state(
-                                    &mut guard,
-                                    session.as_ref(),
-                                    logind_manager.as_ref(),
-                                    upower_proxy.as_ref(),
-                                    mutter_power.as_ref(),
-                                    gnome_ss.as_ref(),
-                                    fdo_ss.as_ref(),
-                                )
-                                .await;
+                                guard.kbd_idle_dimmed = is_kbd_idle_dimmed();
+                                if mutter_power_stream.is_none()
+                                    || (guard.sysfs_display_off
+                                        && !guard.display_power_save
+                                        && !guard.screensaver_active
+                                        && !guard.session_locked
+                                        && !guard.session_idle
+                                        && guard.session_active
+                                        && !guard.preparing_for_sleep
+                                        && !guard.lid_closed)
+                                {
+                                    guard.sysfs_display_off =
+                                        !crate::sys_paths::is_any_display_powered();
+                                }
                                 if !guard.should_suppress_ambient() {
                                     current_brightness = light_sensor_logic(
                                         level,

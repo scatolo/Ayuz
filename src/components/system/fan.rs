@@ -32,7 +32,10 @@ use crate::services::cpu_tuning::{
 };
 use crate::services::dbus;
 use crate::services::dbus::FanProfile;
-use crate::sys_paths::{CpuPowerTelemetry, clamp_perf_pct, read_cpu_power_telemetry};
+use crate::sys_paths::{
+    CpuPowerTelemetry, FanRpmTelemetry, clamp_perf_pct, format_fan_rpm_summary,
+    read_cpu_power_telemetry, read_fan_rpm_telemetry,
+};
 
 static MAX_PERF_APPLY_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -80,12 +83,32 @@ pub fn format_cpu_telemetry(tel: &CpuPowerTelemetry) -> Option<String> {
     }
 }
 
+/// Formats fan RPM telemetry for display in System -> Fan Mode.
+pub fn format_fan_rpm_status(tel: &FanRpmTelemetry) -> String {
+    if tel.fans.is_empty() {
+        return t!("fan_rpm_unavailable").to_string();
+    }
+    if tel.fans.iter().all(|f| f.rpm == 0) {
+        return tel
+            .fans
+            .iter()
+            .map(|f| format!("{}: {}", f.label, t!("fan_rpm_off")))
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
+    format_fan_rpm_summary(tel).unwrap_or_else(|| t!("fan_rpm_unavailable").to_string())
+}
+
 /// State for the fan profile settings component.
 pub struct FanModel {
     /// Whether the `asusd` daemon is reachable; disables fan profile controls when `false`.
     asusd_available: bool,
     /// The currently active fan profile, used to suppress no-op toggle callbacks.
     current_profile: FanProfile,
+    /// Read-only live fan RPM summary.
+    fan_rpm_subtitle: String,
+    /// Watch channel controlling whether the 3-second live RPM polling loop is active.
+    fan_polling_tx: tokio::sync::watch::Sender<bool>,
     /// Read-only CPU EPP / governor / Turbo Boost / `max_perf_pct` summary.
     cpu_telemetry_subtitle: String,
     /// Only show the CPU telemetry row when at least one cpufreq/intel_pstate field exists.
@@ -121,8 +144,10 @@ pub enum FanMsg {
     CycleFromHotkey,
     /// Apply a fan profile selected from the system tray menu.
     SetFromTray(FanProfile),
-    /// Refresh read-only CPU EPP / Turbo / `intel_pstate` telemetry from sysfs.
+    /// Refresh read-only CPU EPP / Turbo / `intel_pstate` and fan RPM telemetry from sysfs.
     RefreshTelemetry,
+    /// Enable or pause the 3-second live fan RPM polling loop when System page visibility changes.
+    SetPollingActive(bool),
 }
 
 /// Output events emitted by [`FanModel`] to the parent [`AppModel`].
@@ -156,6 +181,8 @@ pub enum FanCommandOutput {
     },
     /// Read-only CPU EPP / Turbo telemetry snapshot.
     CpuTelemetryRead(CpuPowerTelemetry),
+    /// Live fan RPM telemetry snapshot from hwmon.
+    FanRpmRead(FanRpmTelemetry),
     /// An error message to forward as a toast notification.
     Error(String),
 }
@@ -208,6 +235,11 @@ impl FanModel {
                         tokio::task::spawn_blocking(read_cpu_power_telemetry).await
                     {
                         out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                    }
+                    if let Ok(rpm) =
+                        tokio::task::spawn_blocking(read_fan_rpm_telemetry).await
+                    {
+                        out.emit(FanCommandOutput::FanRpmRead(rpm));
                     }
                 })
                 .drop_on_shutdown()
@@ -272,6 +304,20 @@ impl Component for FanModel {
                 #[watch]
                 set_visible: !model.asusd_available,
                 set_label: &t!("asusd_missing_warning"),
+            },
+
+            add = &adw::ActionRow {
+                set_title: &t!("fan_rpm_title"),
+                #[watch]
+                set_subtitle: &gtk::glib::markup_escape_text(&model.fan_rpm_subtitle),
+
+                add_suffix = &gtk::Button {
+                    set_icon_name: "view-refresh-symbolic",
+                    add_css_class: "flat",
+                    set_valign: gtk::Align::Center,
+                    set_tooltip_text: Some(&t!("fan_rpm_refresh_tooltip")),
+                    connect_clicked => FanMsg::RefreshTelemetry,
+                },
             },
 
             add = &adw::ActionRow {
@@ -375,9 +421,13 @@ impl Component for FanModel {
             });
         }
 
+        let (fan_polling_tx, mut fan_polling_rx) = tokio::sync::watch::channel(false);
+
         let model = FanModel {
             asusd_available: false,
             current_profile: saved_profile,
+            fan_rpm_subtitle: "…".to_string(),
+            fan_polling_tx,
             cpu_telemetry_subtitle: String::new(),
             cpu_telemetry_available: false,
             max_perf_supported: false,
@@ -399,6 +449,37 @@ impl Component for FanModel {
                 .register(async move {
                     if let Ok(tel) = tokio::task::spawn_blocking(read_cpu_power_telemetry).await {
                         out.emit(FanCommandOutput::CpuTelemetryRead(tel));
+                    }
+                    if let Ok(rpm) = tokio::task::spawn_blocking(read_fan_rpm_telemetry).await {
+                        out.emit(FanCommandOutput::FanRpmRead(rpm));
+                    }
+                })
+                .drop_on_shutdown()
+        });
+
+        // Poll live fan RPM every 3 seconds while the System page is visible.
+        sender.command(move |out, shutdown| {
+            shutdown
+                .register(async move {
+                    loop {
+                        while !*fan_polling_rx.borrow_and_update() {
+                            if fan_polling_rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+
+                        if let Ok(rpm) = tokio::task::spawn_blocking(read_fan_rpm_telemetry).await {
+                            out.emit(FanCommandOutput::FanRpmRead(rpm));
+                        }
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                            res = fan_polling_rx.changed() => {
+                                if res.is_err() {
+                                    return;
+                                }
+                            }
+                        }
                     }
                 })
                 .drop_on_shutdown()
@@ -613,8 +694,23 @@ impl Component for FanModel {
                             {
                                 out.emit(FanCommandOutput::CpuTelemetryRead(tel));
                             }
+                            if let Ok(rpm) =
+                                tokio::task::spawn_blocking(read_fan_rpm_telemetry).await
+                            {
+                                out.emit(FanCommandOutput::FanRpmRead(rpm));
+                            }
                         })
                         .drop_on_shutdown()
+                });
+            }
+            FanMsg::SetPollingActive(active) => {
+                let _ = self.fan_polling_tx.send_if_modified(|cur| {
+                    if *cur == active {
+                        false
+                    } else {
+                        *cur = active;
+                        true
+                    }
                 });
             }
         }
@@ -715,6 +811,9 @@ impl Component for FanModel {
                 self.max_perf_supported = tel.max_perf_pct.is_some();
                 self.pstate_writable = tel.pstate_writable;
             }
+            FanCommandOutput::FanRpmRead(tel) => {
+                self.fan_rpm_subtitle = format_fan_rpm_status(&tel);
+            }
             FanCommandOutput::Error(e) => {
                 let _ = sender.output(FanOutput::Error(e));
             }
@@ -759,5 +858,35 @@ mod tests {
         let formatted_high = format_cpu_telemetry(&high_min).expect("should format high min");
         assert!(formatted_high.contains(&t!("fan_cpu_max_perf", pct = "100").to_string()));
         assert!(formatted_high.contains(&t!("fan_cpu_min_perf_high", pct = "100").to_string()));
+    }
+
+    #[test]
+    fn test_format_fan_rpm_status() {
+        use crate::sys_paths::FanSensorReading;
+
+        let empty = FanRpmTelemetry::default();
+        assert_eq!(
+            format_fan_rpm_status(&empty),
+            t!("fan_rpm_unavailable").to_string()
+        );
+
+        let zero = FanRpmTelemetry {
+            fans: vec![FanSensorReading {
+                label: "CPU".to_string(),
+                rpm: 0,
+            }],
+        };
+        assert_eq!(
+            format_fan_rpm_status(&zero),
+            format!("CPU: {}", t!("fan_rpm_off"))
+        );
+
+        let running = FanRpmTelemetry {
+            fans: vec![FanSensorReading {
+                label: "CPU".to_string(),
+                rpm: 1766,
+            }],
+        };
+        assert_eq!(format_fan_rpm_status(&running), "CPU: 1766 RPM");
     }
 }

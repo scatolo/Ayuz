@@ -86,6 +86,7 @@ pub struct HomeModel {
     cpu_label: gtk::Label,
     ram_label: gtk::Label,
     disk_label: gtk::Label,
+    fan_label: gtk::Label,
     profiles: Vec<Profile>,
     active_profile_id: String,
     profiles_flow: gtk::FlowBox,
@@ -129,6 +130,7 @@ pub enum HomeCommandOutput {
         cpu: String,
         ram: String,
         disk: String,
+        fan: String,
     },
 }
 
@@ -138,10 +140,12 @@ fn metric_card(icon_name: &str, title: &str) -> (gtk::Box, gtk::Label) {
         .halign(gtk::Align::Start)
         .label("…")
         .build();
+    value_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     let icon = gtk::Image::from_icon_name(icon_name);
     icon.set_pixel_size(16);
     let title_label = gtk::Label::new(Some(title));
+    title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header.append(&icon);
@@ -268,12 +272,19 @@ async fn fetch_metrics(
         })
         .unwrap_or_else(|_| "N/A".to_string());
 
+    let fan = tokio::task::spawn_blocking(read_fan_rpm_telemetry)
+        .await
+        .ok()
+        .map(|tel| format_fan_rpm_card(&tel))
+        .unwrap_or_else(|| "N/A".to_string());
+
     (
         HomeCommandOutput::MetricsRefreshed {
             battery,
             cpu,
             ram,
             disk,
+            fan,
         },
         next_cpu,
     )
@@ -553,6 +564,8 @@ impl Component for HomeModel {
         let (ram_card, ram_label) = metric_card("media-flash-symbolic", &t!("home_metric_ram"));
         let (disk_card, disk_label) =
             metric_card("drive-harddisk-symbolic", &t!("home_metric_disk"));
+        let (fan_card, fan_label) =
+            metric_card("weather-windy-symbolic", &t!("home_metric_fan"));
 
         let metrics_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -563,6 +576,7 @@ impl Component for HomeModel {
         metrics_box.append(&cpu_card);
         metrics_box.append(&ram_card);
         metrics_box.append(&disk_card);
+        metrics_box.append(&fan_card);
 
         // Profiles section
         let config = AppConfig::load();
@@ -615,6 +629,7 @@ impl Component for HomeModel {
             cpu_label,
             ram_label,
             disk_label,
+            fan_label,
             profiles,
             active_profile_id,
             profiles_flow,
@@ -975,11 +990,13 @@ impl Component for HomeModel {
                 cpu,
                 ram,
                 disk,
+                fan,
             } => {
                 self.battery_label.set_label(&battery);
                 self.cpu_label.set_label(&cpu);
                 self.ram_label.set_label(&ram);
                 self.disk_label.set_label(&disk);
+                self.fan_label.set_label(&fan);
             }
         }
     }

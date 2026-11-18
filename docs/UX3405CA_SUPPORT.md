@@ -1,6 +1,6 @@
 # ASUS Zenbook 14 OLED (UX3405CA) & Fedora 44 / 45 GNOME Wayland Support
 
-Technical reference for the `scatolo/Ayuz` fork (`1.2.2`), documenting how Ayuz adapts to **ASUS Zenbook 14 OLED (UX3405CA)** on **Fedora 44 / 45 · GNOME (Wayland)** (GNOME 48–51) and how automated releases are built.
+Technical reference for the `scatolo/Ayuz` fork (`1.3.0`), documenting how Ayuz adapts to **ASUS Zenbook 14 OLED (UX3405CA)** on **Fedora 44 / 45 · GNOME (Wayland)** (GNOME 48–51) and how automated releases are built.
 
 ---
 
@@ -8,13 +8,14 @@ Technical reference for the `scatolo/Ayuz` fork (`1.2.2`), documenting how Ayuz 
 
 | Page | Feature | Status on UX3405CA / Fedora 44–45 GNOME | Backend / Notes |
 | --- | --- | --- | --- |
-| **Home** | Device info & telemetry | Supported | Dynamic sysfs discovery in `src/sys_paths.rs`; serial reveal uses `pkexec cat` |
+| **Home** | Device info & telemetry | Supported | Dynamic sysfs discovery in `src/sys_paths.rs` (battery, CPU temp, RAM, disk, and `acpi_fan` + `asus` fan RPM); serial reveal uses `pkexec cat` |
 | **Home** | Profiles | Supported | Persisted in `~/.config/ayuz/config.json` |
 | **Display** | OLED Flicker-Free Dimming | Disabled (KDE only) | Requires KDE + `kscreen-doctor` |
 | **Display** | Color Gamut | **Excluded from scope** (KDE only) | Requires KDE + `kscreen-doctor`; intentionally not ported to GNOME |
 | **Display** | Target Mode | Disabled (KDE only) | Requires KWin `diminactive` + `kwriteconfig6` / `qdbus` |
 | **Display** | OLED Pixel Refresh | Disabled (KDE only) | Uses KDE `kwriteconfig6` (`powermanagementprofilesrc`) |
 | **Display** | Panel Auto-Hide & Transparency | Disabled (KDE / COSMIC only) | Uses KDE `qdbus` (`org.kde.plasmashell`) or `cosmic_panel.rs` |
+| **Display** | GNOME OLED Care (Screen Blank, Adaptive Brightness, Idle Dim) | Supported | Controls GNOME `idle-delay`, `ambient-enabled`, and `idle-dim` via `gsettings` |
 | **Keyboard** | Auto Backlight | Optional | Requires `iio-sensor-proxy` (`net.hadess.SensorProxy`); checks `logind` lock state |
 | **Keyboard** | Backlight Idle | Optional | Spawns `swayidle` + UPower `KbdBacklight` (`busctl`) |
 | **Keyboard** | FN Key Mode | Optional (Fedora `grubby`) | Checks `grubby`; updates `asus_wmi.fnlock_default` via `pkexec grubby` (reboot required) |
@@ -27,7 +28,7 @@ Technical reference for the `scatolo/Ayuz` fork (`1.2.2`), documenting how Ayuz 
 | **Touchpad** | NumberPad | **SKU-dependent** | Maintainer's UX3405CA SKU has no physical/digital NumberPad LEDs; `UX3405` DMI override (`UX3405MA_5X4` 5×4) applies if LED hardware is present |
 | **Audio** | Volume & Boost (0–150%) | Supported | Reads/sets `@DEFAULT_AUDIO_SINK@` via `wpctl`; optional `pactl subscribe` for live external-change UI sync |
 | **Audio** | Sound Profiles | Optional | Requires `easyeffects`; auto-detects EasyEffects 7.x (`~/.config/easyeffects/output` + `--gapplication-service` on Fedora 44) vs 8.x (`$XDG_DATA_HOME/easyeffects/output` / `~/.local/share/easyeffects/output` + `--service-mode` on Fedora 45) |
-| **System** | Battery Care & Fan Profiles | Optional | Requires `asusd` (`xyz.ljones.Asusd` / `xyz.ljones.Platform`) |
+| **System** | Battery Care & Fan Profiles (+ Live RPM) | Optional / Supported | Fan modes & battery limit require `asusd` (`xyz.ljones.Asusd` / `xyz.ljones.Platform`); live fan RPM reads `/sys/class/hwmon` (`acpi_fan` + `asus`) directly |
 | **System** | Deep Sleep (`s2idle` / `deep`) | Firmware-dependent | Reads `/sys/power/mem_sleep` directly (enabled only if `deep` is advertised); writes via `pkexec tee` |
 | **System** | GPU Mode / APU Mem | Optional / Hardware-dependent | `supergfxd` (`org.supergfxctl.Daemon`) / `asusd` (`xyz.ljones.AsusArmoury`) |
 
@@ -39,8 +40,11 @@ Technical reference for the `scatolo/Ayuz` fork (`1.2.2`), documenting how Ayuz 
 
 - **Battery discovery**: `find_battery_capacity_paths()` scans `/sys/class/power_supply/*` (sorted) for entries whose `type` file equals `Battery` (case-insensitive) and includes a `capacity` file, ignoring `Mains` and `USB` supplies and averaging across discovered batteries (`aggregate_battery_percentage()`).
 - **CPU temperature discovery**: `find_cpu_temp_path()` scans `/sys/class/hwmon/*` (sorted) for `name` matching `coretemp` (Intel Core Ultra on UX3405CA), `k10temp`, `zenpower`, or containing `cpu`. It prefers `temp1_input`, falls back to the first `temp*_input`, and finally falls back to `/sys/class/thermal/thermal_zone0/temp`.
+- **Fan RPM discovery**: `read_fan_rpm_telemetry()` scans `/sys/class/hwmon/*` (sorted) for `asus` / `asus_custom_fan_curve` / `asus-nb-wmi` and `acpi_fan`. Disabled secondary channels (`fan2_input == 0` with `pwm2_enable == "0"`) on single-fan SKUs like UX3405CA are ignored, and `acpi_fan` (`PNP0C0B:00`) overrides the primary fan with 1-RPM precision when reporting `> 0`.
 
 ### 2.2 Smart Gestures on GNOME Wayland (`src/services/edge_gestures.rs`, `src/services/gnome_brightness.rs`)
+
+- **Edge-zone exit cancellation**: Once classified into `LeftEdge`, `RightEdge`, or `TopEdge`, dragging the finger back into the center of the touchpad past `EDGE_EXIT_HYSTERESIS` cancels the gesture into `GestureState::Other`, preventing normal cursor movement that starts near an edge from triggering volume or brightness changes across the pad.
 
 - **Left edge (Volume)**: `adjust_volume()` checks `/usr/bin/wpctl` (or `wpctl` on `$PATH`) via `OnceLock` and uses PipeWire (`wpctl set-mute` / `set-volume @DEFAULT_AUDIO_SINK@ 5%+/-`), falling back to `pactl`.
 - **Right edge (Screen Brightness)**: When `is_gnome_desktop()` is true, `gnome_brightness::adjust_brightness_relative(delta)` runs on the session D-Bus:

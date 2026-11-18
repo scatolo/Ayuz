@@ -73,11 +73,15 @@ pub struct OledCareModel {
     gnome_system_idle_secs: Option<u32>,
     gnome_ambient_active: bool,
     gnome_ambient_configured: Option<bool>,
+    gnome_idle_dim_active: bool,
+    gnome_idle_dim_configured: Option<bool>,
     kde_available: bool,
     panel_ctrl_available: bool,
     gnome_available: bool,
     hide_unsupported: bool,
     screen_blank_combo: adw::ComboRow,
+    ambient_switch: adw::SwitchRow,
+    idle_dim_switch: adw::SwitchRow,
     suppress_signals: Rc<Cell<bool>>,
 }
 
@@ -88,6 +92,7 @@ pub enum OledCareMsg {
     ToggleTransparency(bool),
     SelectScreenBlank(u32),
     ToggleGnomeAmbient(bool),
+    ToggleGnomeIdleDim(bool),
     SetHideUnsupported(bool),
     Refresh,
     LoadProfile {
@@ -96,6 +101,7 @@ pub enum OledCareMsg {
         transparency: bool,
         gnome_screen_blank_secs: Option<u32>,
         gnome_ambient_brightness: Option<bool>,
+        gnome_idle_dim: Option<bool>,
     },
 }
 
@@ -107,6 +113,7 @@ pub enum OledCareCommandOutput {
     GnomeStateLoaded {
         idle_delay: Option<u32>,
         ambient_enabled: Option<bool>,
+        idle_dim: Option<bool>,
     },
     GnomeScreenBlankSet(u32),
     GnomeScreenBlankFailed {
@@ -115,6 +122,12 @@ pub enum OledCareCommandOutput {
     },
     GnomeAmbientSet(bool),
     GnomeAmbientFailed {
+        error: String,
+        rollback_active: bool,
+        rollback_configured: Option<bool>,
+    },
+    GnomeIdleDimSet(bool),
+    GnomeIdleDimFailed {
         error: String,
         rollback_active: bool,
         rollback_configured: Option<bool>,
@@ -151,6 +164,13 @@ impl OledCareModel {
         self.screen_blank_combo
             .set_model(Some(&gtk::StringList::new(&str_refs)));
         self.screen_blank_combo.set_selected(selected_idx);
+        self.suppress_signals.set(false);
+    }
+
+    fn sync_gnome_switches(&self) {
+        self.suppress_signals.set(true);
+        self.ambient_switch.set_active(self.gnome_ambient_active);
+        self.idle_dim_switch.set_active(self.gnome_idle_dim_active);
         self.suppress_signals.set(false);
     }
 }
@@ -190,19 +210,22 @@ impl Component for OledCareModel {
                 set_visible: !model.hide_unsupported || model.gnome_available,
             },
 
-            add = &adw::SwitchRow {
+            add = &model.ambient_switch.clone() -> adw::SwitchRow {
                 set_title: &t!("oled_care_ambient_brightness_title"),
                 set_subtitle: &t!("oled_care_ambient_brightness_subtitle"),
-                #[watch]
-                set_active: model.gnome_ambient_active,
                 #[watch]
                 set_sensitive: model.gnome_available,
                 #[watch]
                 set_visible: !model.hide_unsupported || model.gnome_available,
+            },
 
-                connect_active_notify[sender] => move |switch| {
-                    sender.input(OledCareMsg::ToggleGnomeAmbient(switch.is_active()));
-                },
+            add = &model.idle_dim_switch.clone() -> adw::SwitchRow {
+                set_title: &t!("oled_care_idle_dim_title"),
+                set_subtitle: &t!("oled_care_idle_dim_subtitle"),
+                #[watch]
+                set_sensitive: model.gnome_available,
+                #[watch]
+                set_visible: !model.hide_unsupported || model.gnome_available,
             },
 
             add = &adw::SwitchRow {
@@ -267,6 +290,8 @@ impl Component for OledCareModel {
         let gnome = is_gnome_desktop();
 
         let screen_blank_combo = adw::ComboRow::new();
+        let ambient_switch = adw::SwitchRow::new();
+        let idle_dim_switch = adw::SwitchRow::new();
         let suppress_signals = Rc::new(Cell::new(false));
         {
             let sender = sender.clone();
@@ -278,6 +303,26 @@ impl Component for OledCareModel {
                 sender.input(OledCareMsg::SelectScreenBlank(row.selected()));
             });
         }
+        {
+            let sender = sender.clone();
+            let suppress = suppress_signals.clone();
+            ambient_switch.connect_active_notify(move |switch| {
+                if suppress.get() {
+                    return;
+                }
+                sender.input(OledCareMsg::ToggleGnomeAmbient(switch.is_active()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            let suppress = suppress_signals.clone();
+            idle_dim_switch.connect_active_notify(move |switch| {
+                if suppress.get() {
+                    return;
+                }
+                sender.input(OledCareMsg::ToggleGnomeIdleDim(switch.is_active()));
+            });
+        }
 
         let model = OledCareModel {
             pixel_refresh_active: p.oled_care_pixel_refresh,
@@ -287,20 +332,26 @@ impl Component for OledCareModel {
             gnome_system_idle_secs: None,
             gnome_ambient_active: p.gnome_ambient_brightness.unwrap_or(false),
             gnome_ambient_configured: p.gnome_ambient_brightness,
+            gnome_idle_dim_active: p.gnome_idle_dim.unwrap_or(false),
+            gnome_idle_dim_configured: p.gnome_idle_dim,
             kde_available: kde,
             panel_ctrl_available: kde || cosmic,
             gnome_available: gnome,
             hide_unsupported: config.hide_unsupported_hardware,
             screen_blank_combo,
+            ambient_switch,
+            idle_dim_switch,
             suppress_signals,
         };
         model.rebuild_screen_blank_combo();
+        model.sync_gnome_switches();
 
         let widgets = view_output!();
 
         if gnome {
             let configured_blank = model.gnome_screen_blank_secs;
             let configured_ambient = model.gnome_ambient_configured;
+            let configured_idle_dim = model.gnome_idle_dim_configured;
             sender.command(move |out, shutdown| {
                 shutdown
                     .register(async move {
@@ -310,10 +361,14 @@ impl Component for OledCareModel {
                         if let Some(enabled) = configured_ambient {
                             let _ = set_gnome_ambient_enabled(enabled).await;
                         }
-                        let (idle_delay, ambient_enabled) = read_gnome_oled_care_state().await;
+                        if let Some(enabled) = configured_idle_dim {
+                            let _ = set_gnome_idle_dim(enabled).await;
+                        }
+                        let state = read_gnome_oled_care_state().await;
                         out.emit(OledCareCommandOutput::GnomeStateLoaded {
-                            idle_delay,
-                            ambient_enabled,
+                            idle_delay: state.idle_delay,
+                            ambient_enabled: state.ambient_enabled,
+                            idle_dim: state.idle_dim,
                         });
                     })
                     .drop_on_shutdown()
@@ -502,6 +557,37 @@ impl Component for OledCareModel {
                     });
                 }
             }
+            OledCareMsg::ToggleGnomeIdleDim(active) => {
+                if active == self.gnome_idle_dim_active {
+                    return;
+                }
+                let prev_active = self.gnome_idle_dim_active;
+                let prev_configured = self.gnome_idle_dim_configured;
+                self.gnome_idle_dim_active = active;
+                self.gnome_idle_dim_configured = Some(active);
+                AppConfig::update(|c| c.active_profile_mut().gnome_idle_dim = Some(active));
+
+                if self.gnome_available {
+                    sender.command(move |out, shutdown| {
+                        shutdown
+                            .register(async move {
+                                match set_gnome_idle_dim(active).await {
+                                    Ok(()) => {
+                                        out.emit(OledCareCommandOutput::GnomeIdleDimSet(active))
+                                    }
+                                    Err(error) => {
+                                        out.emit(OledCareCommandOutput::GnomeIdleDimFailed {
+                                            error,
+                                            rollback_active: prev_active,
+                                            rollback_configured: prev_configured,
+                                        })
+                                    }
+                                }
+                            })
+                            .drop_on_shutdown()
+                    });
+                }
+            }
             OledCareMsg::Refresh => {
                 if !self.gnome_available {
                     return;
@@ -509,10 +595,11 @@ impl Component for OledCareModel {
                 sender.command(|out, shutdown| {
                     shutdown
                         .register(async move {
-                            let (idle_delay, ambient_enabled) = read_gnome_oled_care_state().await;
+                            let state = read_gnome_oled_care_state().await;
                             out.emit(OledCareCommandOutput::GnomeStateLoaded {
-                                idle_delay,
-                                ambient_enabled,
+                                idle_delay: state.idle_delay,
+                                ambient_enabled: state.ambient_enabled,
+                                idle_dim: state.idle_dim,
                             });
                         })
                         .drop_on_shutdown()
@@ -524,6 +611,7 @@ impl Component for OledCareModel {
                 transparency,
                 gnome_screen_blank_secs,
                 gnome_ambient_brightness,
+                gnome_idle_dim,
             } => {
                 if self.panel_ctrl_available {
                     if self.kde_available {
@@ -536,11 +624,16 @@ impl Component for OledCareModel {
                 if self.gnome_available {
                     self.gnome_screen_blank_secs = gnome_screen_blank_secs;
                     self.gnome_ambient_configured = gnome_ambient_brightness;
+                    self.gnome_idle_dim_configured = gnome_idle_dim;
                     self.rebuild_screen_blank_combo();
 
                     if let Some(enabled) = gnome_ambient_brightness {
                         self.gnome_ambient_active = enabled;
                     }
+                    if let Some(enabled) = gnome_idle_dim {
+                        self.gnome_idle_dim_active = enabled;
+                    }
+                    self.sync_gnome_switches();
 
                     sender.command(move |out, shutdown| {
                         shutdown
@@ -560,12 +653,24 @@ impl Component for OledCareModel {
                                         ),
                                         Err(e) => out.emit(OledCareCommandOutput::Error(e)),
                                     }
-                                } else {
-                                    let (idle_delay, ambient_enabled) =
-                                        read_gnome_oled_care_state().await;
+                                }
+                                if let Some(enabled) = gnome_idle_dim {
+                                    match set_gnome_idle_dim(enabled).await {
+                                        Ok(()) => out.emit(
+                                            OledCareCommandOutput::GnomeIdleDimSet(enabled),
+                                        ),
+                                        Err(e) => out.emit(OledCareCommandOutput::Error(e)),
+                                    }
+                                }
+                                if gnome_ambient_brightness.is_none()
+                                    || gnome_idle_dim.is_none()
+                                    || gnome_screen_blank_secs.is_none()
+                                {
+                                    let state = read_gnome_oled_care_state().await;
                                     out.emit(OledCareCommandOutput::GnomeStateLoaded {
-                                        idle_delay,
-                                        ambient_enabled,
+                                        idle_delay: state.idle_delay,
+                                        ambient_enabled: state.ambient_enabled,
+                                        idle_dim: state.idle_dim,
                                     });
                                 }
                             })
@@ -601,6 +706,7 @@ impl Component for OledCareModel {
             OledCareCommandOutput::GnomeStateLoaded {
                 idle_delay,
                 ambient_enabled,
+                idle_dim,
             } => {
                 self.gnome_system_idle_secs = idle_delay;
                 self.rebuild_screen_blank_combo();
@@ -609,6 +715,12 @@ impl Component for OledCareModel {
                 {
                     self.gnome_ambient_active = enabled;
                 }
+                if self.gnome_idle_dim_configured.is_none()
+                    && let Some(enabled) = idle_dim
+                {
+                    self.gnome_idle_dim_active = enabled;
+                }
+                self.sync_gnome_switches();
             }
             OledCareCommandOutput::GnomeScreenBlankSet(secs) => {
                 self.gnome_system_idle_secs = Some(secs);
@@ -648,6 +760,26 @@ impl Component for OledCareModel {
                 AppConfig::update(|c| {
                     c.active_profile_mut().gnome_ambient_brightness = rollback_configured
                 });
+                self.sync_gnome_switches();
+                let _ = sender.output(error);
+            }
+            OledCareCommandOutput::GnomeIdleDimSet(enabled) => {
+                tracing::info!(
+                    "{}",
+                    t!("oled_care_idle_dim_set", value = enabled.to_string())
+                );
+            }
+            OledCareCommandOutput::GnomeIdleDimFailed {
+                error,
+                rollback_active,
+                rollback_configured,
+            } => {
+                self.gnome_idle_dim_active = rollback_active;
+                self.gnome_idle_dim_configured = rollback_configured;
+                AppConfig::update(|c| {
+                    c.active_profile_mut().gnome_idle_dim = rollback_configured
+                });
+                self.sync_gnome_switches();
                 let _ = sender.output(error);
             }
             OledCareCommandOutput::Error(e) => {
@@ -669,14 +801,23 @@ async fn read_gsettings(schema: &str, key: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-async fn read_gnome_oled_care_state() -> (Option<u32>, Option<bool>) {
+struct GnomeOledCareState {
+    idle_delay: Option<u32>,
+    ambient_enabled: Option<bool>,
+    idle_dim: Option<bool>,
+}
+
+async fn read_gnome_oled_care_state() -> GnomeOledCareState {
     let idle_raw = read_gsettings("org.gnome.desktop.session", "idle-delay").await;
     let ambient_raw =
         read_gsettings("org.gnome.settings-daemon.plugins.power", "ambient-enabled").await;
-    (
-        idle_raw.as_deref().and_then(parse_gsettings_uint32),
-        ambient_raw.as_deref().and_then(parse_gsettings_bool),
-    )
+    let idle_dim_raw =
+        read_gsettings("org.gnome.settings-daemon.plugins.power", "idle-dim").await;
+    GnomeOledCareState {
+        idle_delay: idle_raw.as_deref().and_then(parse_gsettings_uint32),
+        ambient_enabled: ambient_raw.as_deref().and_then(parse_gsettings_bool),
+        idle_dim: idle_dim_raw.as_deref().and_then(parse_gsettings_bool),
+    }
 }
 
 async fn set_gnome_idle_delay(secs: u32) -> Result<(), String> {
@@ -693,6 +834,20 @@ async fn set_gnome_ambient_enabled(enabled: bool) -> Result<(), String> {
             "set",
             "org.gnome.settings-daemon.plugins.power",
             "ambient-enabled",
+            val,
+        ],
+    )
+    .await
+}
+
+async fn set_gnome_idle_dim(enabled: bool) -> Result<(), String> {
+    let val = if enabled { "true" } else { "false" };
+    run_command_blocking(
+        "gsettings",
+        &[
+            "set",
+            "org.gnome.settings-daemon.plugins.power",
+            "idle-dim",
             val,
         ],
     )
