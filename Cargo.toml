@@ -1,6 +1,6 @@
 [package]
 name = "ayuz"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Traciges/Ayuz"
@@ -45,7 +45,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
-version = "1.3.0"
+version = "1.3.1"
 assets = [
     { source = "target/release/ayuz", dest = "/usr/bin/ayuz", mode = "755" },
     { source = "packaging/de.guido.ayuz.desktop", dest = "/usr/share/applications/de.guido.ayuz.desktop", mode = "644" },

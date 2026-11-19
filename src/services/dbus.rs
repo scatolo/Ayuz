@@ -14,6 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see https://www.gnu.org/licenses/.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use futures_util::StreamExt;
 use rust_i18n::t;
 
@@ -205,6 +208,102 @@ static POWER_PROFILE_SYNC_SEQ: std::sync::atomic::AtomicU64 =
 static POWER_PROFILE_SYNC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Settling window after an Ayuz-initiated profile write (`ChangeProfile`, `LoadProfile`,
+/// hotkey, tray) during which D-Bus property echoes and concurrent AC/battery daemon
+/// reactions are suppressed.
+pub(crate) const INTERNAL_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_millis(1200);
+/// Settling window after a single-hop cross-sync (`Asusd -> PowerProfiles` or
+/// `PowerProfiles -> Asusd`) during which reverse echoes are suppressed.
+pub(crate) const CROSS_SYNC_SUPPRESS_WINDOW: Duration = Duration::from_millis(900);
+/// Coalescing window for external `asusd` / `UPower.PowerProfiles` signals so simultaneous
+/// AC/battery reactions from both daemons settle into a single event instead of ping-ponging.
+const EXTERNAL_COALESCE_WINDOW: Duration = Duration::from_millis(250);
+
+/// Pure state machine tracking in-flight and recent fan/power profile writes initiated
+/// by Ayuz so self-induced D-Bus `PropertiesChanged` signals and cross-sync echoes
+/// are never misinterpreted as external changes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FanSyncState {
+    in_flight_writes: usize,
+    suppress_until: Option<Instant>,
+}
+
+impl FanSyncState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            in_flight_writes: 0,
+            suppress_until: None,
+        }
+    }
+
+    pub(crate) fn begin_write(&mut self, now: Instant, window: Duration) {
+        self.in_flight_writes = self.in_flight_writes.saturating_add(1);
+        let deadline = now + window;
+        self.suppress_until = Some(self.suppress_until.map_or(deadline, |cur| cur.max(deadline)));
+    }
+
+    pub(crate) fn finish_write(&mut self, now: Instant, window: Duration) {
+        self.in_flight_writes = self.in_flight_writes.saturating_sub(1);
+        let deadline = now + window;
+        self.suppress_until = Some(self.suppress_until.map_or(deadline, |cur| cur.max(deadline)));
+    }
+
+    pub(crate) fn note_external_dispatched(&mut self, now: Instant, window: Duration) {
+        let deadline = now + window;
+        self.suppress_until = Some(self.suppress_until.map_or(deadline, |cur| cur.max(deadline)));
+    }
+
+    pub(crate) fn should_suppress_external(&self, now: Instant) -> bool {
+        self.in_flight_writes > 0 || self.suppress_until.is_some_and(|until| now < until)
+    }
+}
+
+static FAN_SYNC_STATE: Mutex<FanSyncState> = Mutex::new(FanSyncState::new());
+
+fn begin_fan_sync_write(window: Duration) {
+    if let Ok(mut state) = FAN_SYNC_STATE.lock() {
+        state.begin_write(Instant::now(), window);
+    }
+}
+
+fn finish_fan_sync_write(window: Duration) {
+    if let Ok(mut state) = FAN_SYNC_STATE.lock() {
+        state.finish_write(Instant::now(), window);
+    }
+}
+
+fn note_external_event_dispatched() {
+    if let Ok(mut state) = FAN_SYNC_STATE.lock() {
+        state.note_external_dispatched(Instant::now(), CROSS_SYNC_SUPPRESS_WINDOW);
+    }
+}
+
+fn should_suppress_external_profile() -> bool {
+    FAN_SYNC_STATE
+        .lock()
+        .is_ok_and(|state| state.should_suppress_external(Instant::now()))
+}
+
+/// Coalesces two external profile events observed within the same settling burst.
+///
+/// When both `Asusd` and `PowerProfiles` emit changes during the same burst
+/// (e.g. an AC plug/unplug transition), `Asusd` takes precedence as the hardware
+/// platform-profile authority; otherwise the newer event replaces the pending one.
+pub(crate) fn merge_pending_external_event(
+    pending: Option<(ExternalProfileSource, FanProfile)>,
+    incoming: (ExternalProfileSource, FanProfile),
+) -> (ExternalProfileSource, FanProfile) {
+    match pending {
+        None => incoming,
+        Some((ExternalProfileSource::Asusd, asusd_prof))
+            if incoming.0 == ExternalProfileSource::PowerProfiles =>
+        {
+            (ExternalProfileSource::Asusd, asusd_prof)
+        }
+        Some(_) => incoming,
+    }
+}
+
 /// Spawns an ordered background sync of `org.freedesktop.UPower.PowerProfiles`
 /// (`ActiveProfile`) to match `profile`, gracefully ignoring errors when
 /// `PowerProfiles` (e.g. `tuned-ppd` / `power-profiles-daemon`) is unavailable.
@@ -221,6 +320,12 @@ pub async fn sync_power_profile_now(profile: FanProfile) {
 }
 
 async fn sync_power_profile_seq(profile: FanProfile, seq: u64) {
+    begin_fan_sync_write(CROSS_SYNC_SUPPRESS_WINDOW);
+    sync_power_profile_inner(profile, seq).await;
+    finish_fan_sync_write(CROSS_SYNC_SUPPRESS_WINDOW);
+}
+
+async fn sync_power_profile_inner(profile: FanProfile, seq: u64) {
     let _guard = POWER_PROFILE_SYNC_LOCK.lock().await;
     if POWER_PROFILE_SYNC_SEQ.load(std::sync::atomic::Ordering::SeqCst) != seq {
         return;
@@ -272,7 +377,10 @@ async fn write_platform_profile_to_asusd(profile: FanProfile) -> Result<FanProfi
 /// Used when reacting to an external `UPower.PowerProfiles` change (e.g. GNOME Quick Settings)
 /// so `asusd` stays aligned without bouncing a D-Bus write back to `PowerProfiles`.
 pub async fn set_platform_profile_only(profile: FanProfile) -> Result<FanProfile, String> {
-    write_platform_profile_to_asusd(profile).await
+    begin_fan_sync_write(CROSS_SYNC_SUPPRESS_WINDOW);
+    let res = write_platform_profile_to_asusd(profile).await;
+    finish_fan_sync_write(CROSS_SYNC_SUPPRESS_WINDOW);
+    res
 }
 
 /// Applies a fan/platform profile via `asusd` and returns the applied profile on success.
@@ -285,9 +393,19 @@ pub async fn set_platform_profile_only(profile: FanProfile) -> Result<FanProfile
 /// Also triggers a best-effort background sync of `org.freedesktop.UPower.PowerProfiles`
 /// so desktop power-mode indicators (e.g. GNOME Quick Settings) stay aligned.
 pub async fn set_fan_profile(profile: FanProfile) -> Result<FanProfile, String> {
-    let applied = write_platform_profile_to_asusd(profile).await?;
-    spawn_sync_power_profile(applied);
-    Ok(applied)
+    begin_fan_sync_write(INTERNAL_WRITE_SUPPRESS_WINDOW);
+    let res = write_platform_profile_to_asusd(profile).await;
+    match res {
+        Ok(applied) => {
+            finish_fan_sync_write(INTERNAL_WRITE_SUPPRESS_WINDOW);
+            spawn_sync_power_profile(applied);
+            Ok(applied)
+        }
+        Err(e) => {
+            finish_fan_sync_write(Duration::from_millis(300));
+            Err(e)
+        }
+    }
 }
 
 /// Origin of an externally observed fan/power profile change.
@@ -328,6 +446,9 @@ pub async fn watch_external_fan_profile_changes(
         None => None,
     };
 
+    let mut pending_external: Option<(ExternalProfileSource, FanProfile)> = None;
+    let mut coalesce_deadline: Option<tokio::time::Instant> = None;
+
     loop {
         tokio::select! {
             maybe = asusd_stream.next() => {
@@ -340,9 +461,16 @@ pub async fn watch_external_fan_profile_changes(
                         continue;
                     }
                     last_asusd = Some(profile);
-                    if tx.send((ExternalProfileSource::Asusd, profile)).is_err() {
-                        break;
+                    if should_suppress_external_profile() {
+                        pending_external = None;
+                        coalesce_deadline = None;
+                        continue;
                     }
+                    pending_external = Some(merge_pending_external_event(
+                        pending_external,
+                        (ExternalProfileSource::Asusd, profile),
+                    ));
+                    coalesce_deadline = Some(tokio::time::Instant::now() + EXTERNAL_COALESCE_WINDOW);
                 }
             }
             maybe = async {
@@ -357,14 +485,39 @@ pub async fn watch_external_fan_profile_changes(
                             continue;
                         }
                         last_ppd = Some(name.clone());
-                        if let Some(profile) = fan_profile_from_power_profile_name(&name)
-                            && tx.send((ExternalProfileSource::PowerProfiles, profile)).is_err()
-                        {
-                            break;
+                        let Some(profile) = fan_profile_from_power_profile_name(&name) else {
+                            continue;
+                        };
+                        if should_suppress_external_profile() {
+                            pending_external = None;
+                            coalesce_deadline = None;
+                            continue;
                         }
+                        pending_external = Some(merge_pending_external_event(
+                            pending_external,
+                            (ExternalProfileSource::PowerProfiles, profile),
+                        ));
+                        coalesce_deadline = Some(tokio::time::Instant::now() + EXTERNAL_COALESCE_WINDOW);
                     }
                 } else {
                     ppd_stream = None;
+                }
+            }
+            () = async {
+                match coalesce_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                coalesce_deadline = None;
+                if let Some((source, profile)) = pending_external.take() {
+                    if should_suppress_external_profile() {
+                        continue;
+                    }
+                    note_external_event_dispatched();
+                    if tx.send((source, profile)).is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -1248,6 +1401,63 @@ mod tests {
         assert_eq!(FanProfile::from(2), FanProfile::Quiet);
         assert_eq!(FanProfile::from(3), FanProfile::LowPower);
         assert_eq!(FanProfile::from(99), FanProfile::Balanced);
+    }
+
+    #[test]
+    fn test_fan_sync_state_suppresses_in_flight_and_settle_window() {
+        let t0 = Instant::now();
+        let mut state = FanSyncState::new();
+        assert!(!state.should_suppress_external(t0));
+
+        // While a write is in flight, external signals must be suppressed even after window.
+        state.begin_write(t0, INTERNAL_WRITE_SUPPRESS_WINDOW);
+        assert!(state.should_suppress_external(t0));
+        assert!(state.should_suppress_external(t0 + Duration::from_secs(5)));
+
+        // Finishing the write extends the suppression window from finish timestamp.
+        let t_done = t0 + Duration::from_millis(200);
+        state.finish_write(t_done, INTERNAL_WRITE_SUPPRESS_WINDOW);
+        assert!(state.should_suppress_external(t_done + Duration::from_millis(1199)));
+        assert!(!state.should_suppress_external(t_done + INTERNAL_WRITE_SUPPRESS_WINDOW));
+    }
+
+    #[test]
+    fn test_fan_sync_state_external_dispatch_prevents_reverse_echo() {
+        let t0 = Instant::now();
+        let mut state = FanSyncState::new();
+        state.note_external_dispatched(t0, CROSS_SYNC_SUPPRESS_WINDOW);
+
+        assert!(state.should_suppress_external(t0 + Duration::from_millis(500)));
+        assert!(!state.should_suppress_external(t0 + CROSS_SYNC_SUPPRESS_WINDOW));
+    }
+
+    #[test]
+    fn test_merge_pending_external_event_prefers_asusd_during_burst() {
+        // Asusd arrives first, then PowerProfiles within the same 250ms AC-transition burst.
+        let pending = Some((ExternalProfileSource::Asusd, FanProfile::Quiet));
+        let merged = merge_pending_external_event(
+            pending,
+            (ExternalProfileSource::PowerProfiles, FanProfile::Balanced),
+        );
+        assert_eq!(merged, (ExternalProfileSource::Asusd, FanProfile::Quiet));
+
+        // PowerProfiles arrives first, then Asusd within the same 250ms burst.
+        let pending_ppd = Some((ExternalProfileSource::PowerProfiles, FanProfile::Balanced));
+        let merged2 = merge_pending_external_event(
+            pending_ppd,
+            (ExternalProfileSource::Asusd, FanProfile::Quiet),
+        );
+        assert_eq!(merged2, (ExternalProfileSource::Asusd, FanProfile::Quiet));
+
+        // Single-source PowerProfiles change (e.g. GNOME Quick Settings) passes through.
+        let single_ppd = merge_pending_external_event(
+            None,
+            (ExternalProfileSource::PowerProfiles, FanProfile::Performance),
+        );
+        assert_eq!(
+            single_ppd,
+            (ExternalProfileSource::PowerProfiles, FanProfile::Performance)
+        );
     }
 
     #[test]

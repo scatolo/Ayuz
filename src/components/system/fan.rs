@@ -17,7 +17,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
 use relm4::adw;
@@ -123,6 +123,7 @@ pub struct FanModel {
     max_perf_presets: Vec<Option<u8>>,
     max_perf_combo: adw::ComboRow,
     suppress_signals: Rc<Cell<bool>>,
+    last_internal_action: Option<Instant>,
     check_performance: gtk::CheckButton,
     check_balanced: gtk::CheckButton,
     check_quiet: gtk::CheckButton,
@@ -189,12 +190,13 @@ pub enum FanCommandOutput {
 
 impl FanModel {
     fn sync_radio_buttons(&self, profile: FanProfile) {
-        self.check_performance
-            .set_active(profile == FanProfile::Performance);
-        self.check_balanced
-            .set_active(profile == FanProfile::Balanced);
-        self.check_quiet
-            .set_active(profile == FanProfile::Quiet || profile == FanProfile::LowPower);
+        self.suppress_signals.set(true);
+        match profile {
+            FanProfile::Performance => self.check_performance.set_active(true),
+            FanProfile::Balanced => self.check_balanced.set_active(true),
+            FanProfile::Quiet | FanProfile::LowPower => self.check_quiet.set_active(true),
+        }
+        self.suppress_signals.set(false);
     }
 
     fn sync_max_perf_combo(&self) {
@@ -395,13 +397,18 @@ impl Component for FanModel {
             FanProfile::Quiet | FanProfile::LowPower => check_quiet.set_active(true),
         }
 
+        let suppress_signals = Rc::new(Cell::new(false));
         for (btn, profile) in [
             (&check_performance, FanProfile::Performance),
             (&check_balanced, FanProfile::Balanced),
             (&check_quiet, FanProfile::Quiet),
         ] {
             let sender = sender.clone();
+            let suppress = suppress_signals.clone();
             btn.connect_toggled(move |b| {
+                if suppress.get() {
+                    return;
+                }
                 if b.is_active() {
                     sender.input(FanMsg::ChangeProfile(profile));
                 }
@@ -409,7 +416,6 @@ impl Component for FanModel {
         }
 
         let max_perf_combo = adw::ComboRow::new();
-        let suppress_signals = Rc::new(Cell::new(false));
         {
             let sender = sender.clone();
             let suppress = suppress_signals.clone();
@@ -436,6 +442,7 @@ impl Component for FanModel {
             max_perf_presets: build_max_perf_presets(saved_max_perf),
             max_perf_combo,
             suppress_signals,
+            last_internal_action: None,
             check_performance,
             check_balanced,
             check_quiet,
@@ -583,6 +590,7 @@ impl Component for FanModel {
                 if dbus::is_equivalent_fan_profile(profile, self.current_profile) {
                     return;
                 }
+                self.last_internal_action = Some(Instant::now());
                 self.current_profile = profile;
                 AppConfig::update(|c| c.active_profile_mut().fan_profile = profile as u32);
                 self.emit_state(&sender);
@@ -603,6 +611,7 @@ impl Component for FanModel {
                     return;
                 }
                 let target = next_profile(self.current_profile);
+                self.last_internal_action = Some(Instant::now());
                 self.current_profile = target;
                 AppConfig::update(|c| c.active_profile_mut().fan_profile = target as u32);
                 self.sync_radio_buttons(target);
@@ -625,6 +634,7 @@ impl Component for FanModel {
                 {
                     return;
                 }
+                self.last_internal_action = Some(Instant::now());
                 self.current_profile = profile;
                 AppConfig::update(|c| c.active_profile_mut().fan_profile = profile as u32);
                 self.sync_radio_buttons(profile);
@@ -645,6 +655,7 @@ impl Component for FanModel {
                 profile,
                 cpu_max_perf_pct,
             } => {
+                self.last_internal_action = Some(Instant::now());
                 self.current_profile = profile;
                 self.sync_radio_buttons(profile);
                 self.emit_state(&sender);
@@ -743,7 +754,9 @@ impl Component for FanModel {
                     FanProfile::LowPower => "LowPower",
                 };
                 tracing::info!("{}", t!("fan_profile_set", profile = name));
+                self.last_internal_action = Some(Instant::now());
                 self.current_profile = profile;
+                self.sync_radio_buttons(profile);
                 self.emit_state(&sender);
                 fan_osd::show(profile, AppConfig::load().fan_osd_enabled);
 
@@ -751,6 +764,12 @@ impl Component for FanModel {
                 self.spawn_refresh_cpu_telemetry(&sender);
             }
             FanCommandOutput::ExternalProfileChanged { source, profile } => {
+                if self
+                    .last_internal_action
+                    .is_some_and(|t| t.elapsed() < dbus::INTERNAL_WRITE_SUPPRESS_WINDOW)
+                {
+                    return;
+                }
                 if dbus::is_equivalent_fan_profile(profile, self.current_profile) {
                     return;
                 }
